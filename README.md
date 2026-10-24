@@ -67,6 +67,13 @@ Salidas: `basename.NNNN.vtk` (VTK *legacy*, malla rectilínea, datos de celda `r
 vx3 Bx1 Bx2 Bx3`, mismo diseño que PLUTO, así que los lectores de PLUTO funcionan) y
 `basename.hst` (masa, momento, energías, máx|∇·B|).
 
+## Pruebas
+
+- `tests/convergence.sh`: órdenes de convergencia (abajo).
+- `tests/physics.sh`: cada módulo físico contra su solución exacta.
+- `ctest` (o `./build/symmetry_test`): simetría especular bit a bit de reconstrucción y
+  solvers de Riemann.
+
 ## Validación (`tests/convergence.sh`)
 
 Onda de Alfvén circularmente polarizada (solución exacta no lineal; vuelve al estado inicial
@@ -105,9 +112,15 @@ límite parabólico de paso de tiempo `dt ≤ cfl·dx²/(2·ndim·max(ν, η, χ
 Limitaciones conocidas:
 - Las paredes reflectantes requieren B normal nulo en la pared (como en Athena++); con
   B_n ≠ 0 no son un espejo y no conservan masa.
-- PLM + HLLE es *bitwise* simétrico bajo reflexiones; PPM, WENO-Z y HLLD introducen
-  asimetrías de 10⁻¹⁶ que un flujo inestable (p. ej. la cáscara de un blast) amplifica,
-  igual que en cualquier otro código.
+- Simetría especular *bitwise*: toda la aritmética de PLM/PPM/WENO-Z, HLLE/HLLD y las EMF de
+  esquina está escrita en forma simétrica (sumas agrupadas en pares que son imágenes
+  especulares exactas, productos en el mismo orden a ambos lados, ramas con promedio en los
+  empates), siguiendo Fleischmann, Adami & Adams (2019). `tests/symmetry_test.cpp` lo
+  verifica con 200 000 estados aleatorios por kernel, y un blast MHD conserva su simetría a
+  0.0 durante toda la corrida. Requiere compilar sin contracción FMA (`-ffp-contract=off`,
+  el valor por defecto; `-D CHASQUI_ALLOW_FMA=ON` la reactiva a cambio de perder la simetría
+  exacta). En GPU, `nvcc` contrae FMA por defecto: usar `-fmad=false` si se quiere la
+  simetría exacta allí.
 - Sin MPI, sin AMR, sin geometrías curvilíneas, sin EOS no ideales todavía.
 
 ## Problemas incluidos

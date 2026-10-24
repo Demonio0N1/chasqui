@@ -57,7 +57,13 @@ KOKKOS_INLINE_FUNCTION void HLLE(const State &L, const State &R, Real bn, const 
 }
 
 // ---------------------------------------------------------------------------------------
-// HLLD (Miyoshi & Kusano 2005)
+// HLLD (Miyoshi & Kusano 2005).
+//
+// Every expression is written so that mirrored inputs (L <-> R, u -> -u, bn -> -bn) give
+// bitwise mirrored outputs: sums of more than two terms are grouped in pairs that are exact
+// mirror images, products are ordered identically on both sides, and the left/right code
+// paths are literal copies of each other (see Fleischmann, Adami & Adams 2019 for why this
+// matters: floating-point addition is commutative but not associative).
 KOKKOS_INLINE_FUNCTION void HLLD(const State &L, const State &R, Real bn, const EOS &eos, Real f[NFLX]) {
   Real fl[NFLX], fr[NFLX], el, er, ptl, ptr;
   PhysFlux(L, bn, eos.gm1, el, ptl, fl);
@@ -75,54 +81,55 @@ KOKKOS_INLINE_FUNCTION void HLLD(const State &L, const State &R, Real bn, const 
   const Real srmr = sr - R.u;   // (S_R - u_R) > 0
   const Real dsl = L.d * slml;  // rho_L (S_L - u_L)
   const Real dsr = R.d * srmr;  // rho_R (S_R - u_R)
+  const Real iden = Real(1) / (dsr - dsl);
 
   // contact speed and total pressure in the star regions (MK05 eqs. 38, 41)
-  const Real sm = (dsr * R.u - dsl * L.u - ptr + ptl) / (dsr - dsl);
-  const Real pts = (dsr * ptl - dsl * ptr + L.d * R.d * srmr * slml * (R.u - L.u)) / (dsr - dsl);
+  const Real sm = ((dsr * R.u - dsl * L.u) + (ptl - ptr)) * iden;
+  const Real pts = ((dsr * ptl - dsl * ptr) + ((L.d * R.d) * (srmr * slml)) * (R.u - L.u)) * iden;
 
   // ---- left star state (MK05 eqs. 43-47) ----
   const Real slms = sl - sm;
   const Real dls = dsl / slms;                       // rho*_L
   Real vls, wls, byls, bzls;
   {
-    const Real den = L.d * slml * slms - bnsq;
-    const Real scale = fabs(L.d * slml * slms) + bnsq;
+    const Real den = (L.d * slml) * slms - bnsq;
+    const Real scale = fabs((L.d * slml) * slms) + bnsq;
     if (fabs(den) <= Real(1e-12) * scale + Real(1e-300)) {
       vls = L.v; wls = L.w; byls = L.by; bzls = L.bz;  // degenerate: no jump across S_L
     } else {
-      const Real num_v = bn * (sm - L.u) / den;
+      const Real num_v = (bn * (sm - L.u)) / den;
       vls = L.v - L.by * num_v;
       wls = L.w - L.bz * num_v;
-      const Real num_b = (L.d * slml * slml - bnsq) / den;
+      const Real num_b = ((L.d * slml) * slml - bnsq) / den;
       byls = L.by * num_b;
       bzls = L.bz * num_b;
     }
   }
-  const Real vdotb_l = L.u * bn + L.v * L.by + L.w * L.bz;
-  const Real vdotb_ls = sm * bn + vls * byls + wls * bzls;
-  const Real els = (slml * el - ptl * L.u + pts * sm + bn * (vdotb_l - vdotb_ls)) / slms;
+  const Real vdotb_l = (L.u * bn + L.v * L.by) + L.w * L.bz;
+  const Real vdotb_ls = (sm * bn + vls * byls) + wls * bzls;
+  const Real els = (((slml * el - ptl * L.u) + pts * sm) + bn * (vdotb_l - vdotb_ls)) / slms;
 
-  // ---- right star state ----
+  // ---- right star state (literal mirror of the left block) ----
   const Real srms = sr - sm;
   const Real drs = dsr / srms;
   Real vrs, wrs, byrs, bzrs;
   {
-    const Real den = R.d * srmr * srms - bnsq;
-    const Real scale = fabs(R.d * srmr * srms) + bnsq;
+    const Real den = (R.d * srmr) * srms - bnsq;
+    const Real scale = fabs((R.d * srmr) * srms) + bnsq;
     if (fabs(den) <= Real(1e-12) * scale + Real(1e-300)) {
       vrs = R.v; wrs = R.w; byrs = R.by; bzrs = R.bz;
     } else {
-      const Real num_v = bn * (sm - R.u) / den;
+      const Real num_v = (bn * (sm - R.u)) / den;
       vrs = R.v - R.by * num_v;
       wrs = R.w - R.bz * num_v;
-      const Real num_b = (R.d * srmr * srmr - bnsq) / den;
+      const Real num_b = ((R.d * srmr) * srmr - bnsq) / den;
       byrs = R.by * num_b;
       bzrs = R.bz * num_b;
     }
   }
-  const Real vdotb_r = R.u * bn + R.v * R.by + R.w * R.bz;
-  const Real vdotb_rs = sm * bn + vrs * byrs + wrs * bzrs;
-  const Real ers = (srmr * er - ptr * R.u + pts * sm + bn * (vdotb_r - vdotb_rs)) / srms;
+  const Real vdotb_r = (R.u * bn + R.v * R.by) + R.w * R.bz;
+  const Real vdotb_rs = (sm * bn + vrs * byrs) + wrs * bzrs;
+  const Real ers = (((srmr * er - ptr * R.u) + pts * sm) + bn * (vdotb_r - vdotb_rs)) / srms;
 
   // Alfven speeds bounding the double-star region (MK05 eq. 51)
   const Real sqdl = sqrt(dls), sqdr = sqrt(drs);
@@ -130,51 +137,51 @@ KOKKOS_INLINE_FUNCTION void HLLD(const State &L, const State &R, Real bn, const 
   const Real sls = sm - abn / sqdl;
   const Real srs = sm + abn / sqdr;
 
-  // conserved star states
+  // conserved states
   const Real uls[NFLX] = {dls, dls * sm, dls * vls, dls * wls, els, byls, bzls};
   const Real urs[NFLX] = {drs, drs * sm, drs * vrs, drs * wrs, ers, byrs, bzrs};
   const Real ul[NFLX] = {L.d, L.d * L.u, L.d * L.v, L.d * L.w, el, L.by, L.bz};
   const Real ur[NFLX] = {R.d, R.d * R.u, R.d * R.v, R.d * R.w, er, R.by, R.bz};
 
-  if (sls >= Real(0)) {
-    for (int n = 0; n < NFLX; ++n) f[n] = fl[n] + sl * (uls[n] - ul[n]);
-    return;
+  Real fls[NFLX], frs[NFLX];   // single-star fluxes
+  for (int n = 0; n < NFLX; ++n) {
+    fls[n] = fl[n] + sl * (uls[n] - ul[n]);
+    frs[n] = fr[n] + sr * (urs[n] - ur[n]);
   }
-  if (srs <= Real(0)) {
-    for (int n = 0; n < NFLX; ++n) f[n] = fr[n] + sr * (urs[n] - ur[n]);
-    return;
-  }
+  // strict inequalities: when S*_L = S*_R = 0 (bn = 0 and S_M = 0) both sides are averaged
+  // below instead of picking one, which keeps a mirror-symmetric pair exactly symmetric
+  if (sls > Real(0)) { for (int n = 0; n < NFLX; ++n) f[n] = fls[n]; return; }
+  if (srs < Real(0)) { for (int n = 0; n < NFLX; ++n) f[n] = frs[n]; return; }
 
   // ---- double-star states (MK05 eqs. 59-63) ----
-  // If bn is (numerically) zero the double-star region collapses onto the star states.
+  // If bn is (numerically) zero the double-star region collapses onto the star states: a
+  // single contact, selected by the sign of S_M (both sides averaged when S_M is exactly 0).
   const Real bnsmall = Real(1e-12) * (ptl + ptr);
-  Real vss, wss, byss, bzss;
   if (bnsq <= bnsmall) {
-    // treat as a single contact: pick the side by S_M
-    if (sm >= Real(0)) {
-      for (int n = 0; n < NFLX; ++n) f[n] = fl[n] + sl * (uls[n] - ul[n]);
-    } else {
-      for (int n = 0; n < NFLX; ++n) f[n] = fr[n] + sr * (urs[n] - ur[n]);
-    }
+    if (sm > Real(0))      { for (int n = 0; n < NFLX; ++n) f[n] = fls[n]; }
+    else if (sm < Real(0)) { for (int n = 0; n < NFLX; ++n) f[n] = frs[n]; }
+    else                   { for (int n = 0; n < NFLX; ++n) f[n] = Real(0.5) * (fls[n] + frs[n]); }
     return;
   }
   const Real sgn = SIGN(bn);
   const Real inv = Real(1) / (sqdl + sqdr);
-  vss = (sqdl * vls + sqdr * vrs + (byrs - byls) * sgn) * inv;
-  wss = (sqdl * wls + sqdr * wrs + (bzrs - bzls) * sgn) * inv;
-  byss = (sqdl * byrs + sqdr * byls + sqdl * sqdr * (vrs - vls) * sgn) * inv;
-  bzss = (sqdl * bzrs + sqdr * bzls + sqdl * sqdr * (wrs - wls) * sgn) * inv;
-  const Real vdotb_ss = sm * bn + vss * byss + wss * bzss;
+  const Real vss = ((sqdl * vls + sqdr * vrs) + (byrs - byls) * sgn) * inv;
+  const Real wss = ((sqdl * wls + sqdr * wrs) + (bzrs - bzls) * sgn) * inv;
+  const Real byss = ((sqdl * byrs + sqdr * byls) + (sqdl * sqdr) * ((vrs - vls) * sgn)) * inv;
+  const Real bzss = ((sqdl * bzrs + sqdr * bzls) + (sqdl * sqdr) * ((wrs - wls) * sgn)) * inv;
+  const Real vdotb_ss = (sm * bn + vss * byss) + wss * bzss;
 
-  if (sm >= Real(0)) {
-    const Real elss = els - sqdl * (vdotb_ls - vdotb_ss) * sgn;
-    const Real ulss[NFLX] = {dls, dls * sm, dls * vss, dls * wss, elss, byss, bzss};
-    for (int n = 0; n < NFLX; ++n)
-      f[n] = fl[n] + sl * (uls[n] - ul[n]) + sls * (ulss[n] - uls[n]);
+  const Real elss = els - sqdl * ((vdotb_ls - vdotb_ss) * sgn);
+  const Real erss = ers + sqdr * ((vdotb_rs - vdotb_ss) * sgn);
+  const Real ulss[NFLX] = {dls, dls * sm, dls * vss, dls * wss, elss, byss, bzss};
+  const Real urss[NFLX] = {drs, drs * sm, drs * vss, drs * wss, erss, byss, bzss};
+
+  if (sm > Real(0)) {
+    for (int n = 0; n < NFLX; ++n) f[n] = fls[n] + sls * (ulss[n] - uls[n]);
+  } else if (sm < Real(0)) {
+    for (int n = 0; n < NFLX; ++n) f[n] = frs[n] + srs * (urss[n] - urs[n]);
   } else {
-    const Real erss = ers + sqdr * (vdotb_rs - vdotb_ss) * sgn;
-    const Real urss[NFLX] = {drs, drs * sm, drs * vss, drs * wss, erss, byss, bzss};
     for (int n = 0; n < NFLX; ++n)
-      f[n] = fr[n] + sr * (urs[n] - ur[n]) + srs * (urss[n] - urs[n]);
+      f[n] = Real(0.5) * ((fls[n] + sls * (ulss[n] - uls[n])) + (frs[n] + srs * (urss[n] - urs[n])));
   }
 }
