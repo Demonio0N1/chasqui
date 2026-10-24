@@ -1,0 +1,26 @@
+[mesh]
+nx1 = 128
+nx2 = 128
+nx3 = 1
+x1min = 0.0
+x1max = 1.0
+x2min = 0.0
+x2max = 1.0
+
+[time]
+integrator = rk3
+cfl = 0.4
+tlim = 0.5
+
+[mhd]
+gamma = 1.6666666666666667
+reconstruct = ppm
+rsolver = hlld
+
+[problem]
+name = orszag_tang
+
+[output]
+basename = ot
+vtk_dt = 0.1
+hst_dt = 0.01

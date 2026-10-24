@@ -1,0 +1,5 @@
+build*/
+*.vtk
+*.hst
+*_errors.dat
+__pycache__/

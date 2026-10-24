@@ -1,0 +1,24 @@
+[mesh]
+nx1 = 400
+nx2 = 1
+nx3 = 1
+x1min = -0.5
+x1max = 0.5
+bc_x1 = outflow
+
+[time]
+integrator = rk3
+cfl = 0.4
+tlim = 0.1
+
+[mhd]
+gamma = 2.0
+reconstruct = ppm
+rsolver = hlld
+
+[problem]
+name = shock_tube
+
+[output]
+basename = bw
+vtk_dt = 0.1

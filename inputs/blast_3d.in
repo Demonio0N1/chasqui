@@ -1,0 +1,34 @@
+[mesh]
+nx1 = 64
+nx2 = 64
+nx3 = 64
+x1min = -0.5
+x1max = 0.5
+x2min = -0.5
+x2max = 0.5
+x3min = -0.5
+x3max = 0.5
+
+[time]
+integrator = rk3
+cfl = 0.3
+tlim = 0.2
+ndiag = 50
+
+[mhd]
+gamma = 1.6666666666666667
+reconstruct = ppm
+rsolver = hlld
+
+[problem]
+name = blast
+pres_in = 10.0
+pres_out = 0.1
+radius = 0.1
+b0 = 1.0
+angle = 45.0
+
+[output]
+basename = blast
+vtk_dt = 0.1
+hst_dt = 0.02

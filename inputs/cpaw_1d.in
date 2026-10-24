@@ -1,0 +1,31 @@
+# Circularly polarized Alfven wave along x (1D). Exact solution: returns to t=0 after T=1.
+[mesh]
+nx1 = 64
+nx2 = 1
+nx3 = 1
+x1min = 0.0
+x1max = 1.0
+
+[time]
+integrator = rk3
+cfl = 0.4
+tlim = 1.0
+
+[mhd]
+gamma = 1.6666666666666667
+reconstruct = ppm
+rsolver = hlld
+
+[problem]
+name = cpaw
+dens = 1.0
+pres = 0.1
+b_par = 1.0
+amp = 0.1
+lambda = 1.0
+angle = 0.0
+
+[output]
+basename = cpaw1d
+hst_dt = 0.1
+compute_error = true

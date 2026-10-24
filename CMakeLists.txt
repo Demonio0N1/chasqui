@@ -1,0 +1,33 @@
+cmake_minimum_required(VERSION 3.16)
+project(chasqui CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+
+option(CHASQUI_SINGLE_PRECISION "Build with float instead of double" OFF)
+option(CHASQUI_NATIVE "Add -march=native on CPU builds" ON)
+
+# Kokkos: either an installed package (Kokkos_ROOT / CMAKE_PREFIX_PATH) or the
+# submodule at external/kokkos
+find_package(Kokkos QUIET)
+if(NOT Kokkos_FOUND)
+  if(EXISTS ${CMAKE_SOURCE_DIR}/external/kokkos/CMakeLists.txt)
+    add_subdirectory(external/kokkos)
+  else()
+    message(FATAL_ERROR "Kokkos not found. Install it or run: git submodule update --init")
+  endif()
+endif()
+
+add_executable(chasqui src/main.cpp)
+target_include_directories(chasqui PRIVATE src)
+target_link_libraries(chasqui PRIVATE Kokkos::kokkos)
+if(CHASQUI_SINGLE_PRECISION)
+  target_compile_definitions(chasqui PRIVATE CHASQUI_SINGLE_PRECISION)
+endif()
+if(CHASQUI_NATIVE AND NOT Kokkos_ENABLE_CUDA AND NOT Kokkos_ENABLE_HIP)
+  target_compile_options(chasqui PRIVATE -march=native)
+endif()
+target_compile_options(chasqui PRIVATE -O3 -Wall -Wextra)

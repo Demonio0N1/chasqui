@@ -1,0 +1,33 @@
+# Circularly polarized Alfven wave propagating along the diagonal of a sqrt(2) x sqrt(2) box.
+[mesh]
+nx1 = 64
+nx2 = 64
+nx3 = 1
+x1min = 0.0
+x1max = 1.4142135623730951
+x2min = 0.0
+x2max = 1.4142135623730951
+
+[time]
+integrator = rk3
+cfl = 0.4
+tlim = 1.0
+
+[mhd]
+gamma = 1.6666666666666667
+reconstruct = ppm
+rsolver = hlld
+
+[problem]
+name = cpaw
+dens = 1.0
+pres = 0.1
+b_par = 1.0
+amp = 0.1
+lambda = 1.0
+angle = 45.0
+
+[output]
+basename = cpaw2d
+hst_dt = 0.1
+compute_error = true
