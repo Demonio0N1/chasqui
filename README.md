@@ -13,9 +13,11 @@ en un código limitado por ancho de banda de memoria.
 
 | Componente | Opciones | Por defecto |
 |---|---|---|
-| Reconstrucción | `dc`, `plm` (van Leer), `ppm` (Colella-Woodward), `wenoz` (Borges 2008, 5.º orden) | `ppm` |
+| Reconstrucción | `dc`, `plm` (van Leer), `ppm` (Colella-Woodward 1984), `ppmx` (PPM extremo-preservante, Colella & Sekora 2008 / McCorquodale & Colella 2011), `wenoz` (Borges 2008) | `ppm` |
 | Solver de Riemann | `hlld` (Miyoshi & Kusano 2005, 7 ondas), `hlle` | `hlld` |
-| Integración temporal | `rk1`, `rk2`, `rk3` (SSP) | `rk3` |
+| Integración temporal | `rk1`, `rk2`, `rk3` (SSP), `rk4` = SSPRK(4,3) de Spiteri & Ruuth 2002 (3.º orden, estable hasta CFL 2× mayor, 4 etapas) | `rk3` |
+| Aplanado de choques | `flatten` (Colella & Woodward 1984) para ppm/ppmx/wenoz | `true` |
+| Bajo Mach | `low_mach` (Thornber et al. 2008): velocidades de cara mezcladas con z = min(1, M) | `false` |
 | ∇·B | Transporte restringido, EMF de esquina con promedio *upwind* (Gardiner & Stone 2005) | — |
 | Precisión | `double` (defecto) o `float` (`-D CHASQUI_SINGLE_PRECISION=ON`) | `double` |
 
@@ -79,18 +81,22 @@ vx3 Bx1 Bx2 Bx3`, mismo diseño que PLUTO, así que los lectores de PLUTO funcio
 Onda de Alfvén circularmente polarizada (solución exacta no lineal; vuelve al estado inicial
 tras un periodo). Error L1 total tras T = 1, HLLD + RK3, CFL 0.4:
 
-| 1D, N | PLM | PPM | WENO-Z |
-|---|---|---|---|
-| 32  | 1.42e-2 | 1.38e-2 | 3.93e-5 |
-| 64  | 3.99e-3 | 3.20e-3 | 4.21e-6 |
-| 128 | 9.95e-4 | 6.65e-4 | 5.03e-7 |
-| 256 | 2.39e-4 | 1.46e-4 | 6.22e-8 |
-| orden | 2.0 | 2.2 | 3.0 (limitado por RK3) |
+| 1D, N | PLM | PPM | PPMX | WENO-Z |
+|---|---|---|---|---|
+| 32  | 1.42e-2 | 1.38e-2 | 8.33e-5 | 3.93e-5 |
+| 64  | 3.99e-3 | 3.20e-3 | 6.25e-6 | 4.21e-6 |
+| 128 | 9.95e-4 | 6.65e-4 | 5.80e-7 | 5.03e-7 |
+| 256 | 2.39e-4 | 1.46e-4 | 6.47e-8 | 6.22e-8 |
+| orden | 2.0 | 2.2 | 3.2 | 3.0 (ambos limitados por RK3) |
 
 2D oblicua (45°): PLM orden 2.0; WENO-Z orden 2.0 con error 16× menor (el promedio de
 cara→centro de B y la EMF de esquina son de 2.º orden, como en Athena++). 3D: orden → 2.
 ∇·B ≤ 5e-13 y energía total constante a 1e-12 en todas las corridas (CPAW 3D, Orszag-Tang,
 Brio-Wu, blast MHD 3D).
+
+Vórtice de Gresho a bajo Mach (64², PPMX + HLLD, t = 1): energía cinética retenida
+99.08 % a M = 0.01 sin corrección y 99.89 % con `low_mach = true` (igual que a M = 0.1), es
+decir, la disipación deja de crecer al bajar el Mach.
 
 ## Física
 
@@ -135,7 +141,13 @@ desde un potencial vector, que garantiza ∇·B = 0 a nivel de redondeo).
 - [ ] Medir en GPU (RTX 4090) contra AthenaK en el mismo problema.
 - [ ] MPI (descomposición de dominio) y salida HDF5.
 - [ ] EOS isoterma y general; conducción anisótropa (a lo largo de B).
-- [ ] Reconstrucción característica para WENO-Z; límite extremo-preservante para PPM.
+- [ ] Reconstrucción en variables características (reduce las oscilaciones post-choque de
+      PPMX/WENO-Z en Brio-Wu, que el aplanado solo recorta ~15 %).
+- [ ] HLLD de baja disipación de Minoshima & Miyoshi (2021): quita la inestabilidad de choque
+      multidimensional y mejora los flujos casi incompresibles sin recurrir al parche de Thornber.
+- [ ] Formalismo de doble energía / interruptor de entropía para regiones de β muy bajo.
+- [ ] Super-time-stepping RKL2 (Meyer, Balsara & Aslam 2014) para los términos difusivos.
+- [ ] Limitador de positividad de Hu, Adams & Shu (2013) como alternativa al FOFC.
 - [ ] Fronteras definidas por el usuario; términos fuente de usuario; escalares pasivos.
 - [ ] Vectorización del bucle interno en CPU.
 

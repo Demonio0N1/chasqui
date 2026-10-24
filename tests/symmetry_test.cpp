@@ -74,6 +74,7 @@ int main() {
   std::printf("reconstruction (mirror of stencil):\n");
   TestRecon<Recon::plm>("plm", rng);
   TestRecon<Recon::ppm>("ppm", rng);
+  TestRecon<Recon::ppmx>("ppmx", rng);
   TestRecon<Recon::wenoz>("wenoz", rng);
   std::printf("Riemann solvers (mirror of L/R states):\n");
   TestRiemann<false>("hlle", rng);

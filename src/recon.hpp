@@ -77,6 +77,68 @@ KOKKOS_INLINE_FUNCTION void PPM(const Real q[6], Real &ql, Real &qr) {
   qr = bL;
 }
 
+
+// Extremum-preserving PPM (Colella & Sekora 2008; McCorquodale & Colella 2011): fourth-order
+// interface values limited so that smooth extrema are not clipped, which keeps the full
+// accuracy of the parabola on smooth flows while remaining non-oscillatory at shocks.
+// Written in mirror-symmetric arithmetic.
+KOKKOS_INLINE_FUNCTION Real PPMXInterface(Real qm1, Real q0, Real qp1, Real qp2) {
+  // 4th-order interface value between q0 and qp1, then limit it if it is a local extremum
+  const Real C = Real(1.25);
+  Real qf = (Real(7) / Real(12)) * (q0 + qp1) - (Real(1) / Real(12)) * (qm1 + qp2);
+  if ((qf - q0) * (qp1 - qf) < Real(0)) {
+    const Real d2 = Real(3) * ((q0 + qp1) - Real(2) * qf);
+    const Real d2l = (qm1 + qp1) - Real(2) * q0;
+    const Real d2r = (q0 + qp2) - Real(2) * qp1;
+    Real d2lim = Real(0);
+    if (d2 * d2l > Real(0) && d2 * d2r > Real(0)) {
+      d2lim = SIGN(d2) * fmin(fmin(C * fabs(d2l), C * fabs(d2r)), fabs(d2));
+    }
+    qf = Real(0.5) * (q0 + qp1) - d2lim / Real(6);
+  }
+  return qf;
+}
+
+// Limit the parabola of a cell with value q, neighbours (qm2, qm1, qp1, qp2) and interface
+// values (qL, qR); modifies qL, qR in place.
+KOKKOS_INLINE_FUNCTION void PPMXLimit(Real qm2, Real qm1, Real q, Real qp1, Real qp2, Real &qL, Real &qR) {
+  const Real C = Real(1.25);
+  const Real dqm = q - qL, dqp = qR - q;          // jumps to the two faces
+  const bool extremum = (dqm * dqp <= Real(0)) || ((qp1 - q) * (q - qm1) <= Real(0));
+  if (extremum) {
+    const Real d2 = Real(6) * ((qL + qR) - Real(2) * q);   // second derivative of the parabola
+    const Real d2c = (qm1 + qp1) - Real(2) * q;
+    const Real d2l = (qm2 + q) - Real(2) * qm1;
+    const Real d2r = (q + qp2) - Real(2) * qp1;
+    Real d2lim = Real(0);
+    if (d2 * d2c > Real(0) && d2 * d2l > Real(0) && d2 * d2r > Real(0)) {
+      d2lim = SIGN(d2) * fmin(fmin(C * fabs(d2l), C * fabs(d2r)), fmin(C * fabs(d2c), fabs(d2)));
+    }
+    const Real rho = (fabs(d2) > Real(1e-12) * (fabs(q) + fabs(qm1) + fabs(qp1)) + Real(1e-300)) ? d2lim / d2 : Real(0);
+    if (rho < Real(1) - Real(1e-12)) {
+      qL = q - rho * dqm;
+      qR = q + rho * dqp;
+    }
+  } else {
+    // monotone cell: keep the parabola from overshooting
+    if (fabs(dqm) >= Real(2) * fabs(dqp)) qL = q - Real(2) * dqp;
+    if (fabs(dqp) >= Real(2) * fabs(dqm)) qR = q + Real(2) * dqm;
+  }
+}
+
+KOKKOS_INLINE_FUNCTION void PPMX(const Real q[6], Real &ql, Real &qr) {
+  // interface values at i-3/2, i-1/2, i+1/2
+  const Real qm32 = PPMXInterface(q[0], q[1], q[2], q[3]);
+  const Real qm12 = PPMXInterface(q[1], q[2], q[3], q[4]);
+  const Real qp12 = PPMXInterface(q[2], q[3], q[4], q[5]);
+  Real aL = qm32, aR = qm12;
+  PPMXLimit(q[0], q[1], q[2], q[3], q[4], aL, aR);   // cell i-1
+  ql = aR;
+  Real bL = qm12, bR = qp12;
+  PPMXLimit(q[1], q[2], q[3], q[4], q[5], bL, bR);   // cell i
+  qr = bL;
+}
+
 // WENO-Z (Borges et al. 2008) right-interface value of the cell whose 5-point
 // stencil is f[0..4] = (f_{-2}, f_{-1}, f_0, f_1, f_2).
 KOKKOS_INLINE_FUNCTION Real WENOZRight(Real fm2, Real fm1, Real f0, Real fp1, Real fp2) {
@@ -108,11 +170,28 @@ KOKKOS_INLINE_FUNCTION void WENOZ(const Real q[6], Real &ql, Real &qr) {
   qr = WENOZRight(q[5], q[4], q[3], q[2], q[1]);
 }
 
+
+// Shock flattening (Colella & Woodward 1984, Appendix): a cell inside a strong compressive
+// pressure jump gets its reconstructed face values pulled back toward the cell value.
+// Inputs: pressures p[0..4] = (p_{j-2}, ..., p_{j+2}) and normal velocities u_{j-1}, u_{j+1}
+// of the cell j. Returns the flattening coefficient in [0,1] (1 = donor cell).
+// Written in mirror-symmetric arithmetic.
+KOKKOS_INLINE_FUNCTION Real Flattening(const Real p[5], Real um1, Real up1) {
+  const Real dp = p[3] - p[1];                 // p_{j+1} - p_{j-1}
+  const Real dp2 = p[4] - p[0];                // p_{j+2} - p_{j-2}
+  const Real pmin = fmin(p[1], p[3]);
+  const bool strong = (fabs(dp) > Real(0.33) * pmin) && (um1 > up1);   // steep and compressive
+  if (!strong) return Real(0);
+  const Real ratio = (fabs(dp2) > Real(1e-300)) ? dp / dp2 : Real(0);
+  return fmin(Real(1), fmax(Real(0), Real(10) * (ratio - Real(0.75))));
+}
+
 template <Recon R>
 KOKKOS_INLINE_FUNCTION void Face(const Real q[6], Real &ql, Real &qr) {
   if constexpr (R == Recon::dc) DC(q, ql, qr);
   else if constexpr (R == Recon::plm) PLM(q, ql, qr);
   else if constexpr (R == Recon::ppm) PPM(q, ql, qr);
+  else if constexpr (R == Recon::ppmx) PPMX(q, ql, qr);
   else WENOZ(q, ql, qr);
 }
 

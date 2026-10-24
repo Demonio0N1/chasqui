@@ -178,6 +178,35 @@ inline void ShockTube(Params &pin, const Mesh &m, HostFields &h) {
 }
 
 
+
+// Gresho vortex (Gresho & Chan 1990) at a prescribed Mach number (Miczek et al. 2015):
+// a stationary rotating flow in pressure equilibrium; any decay of its kinetic energy is
+// numerical dissipation. Domain [-0.5,0.5]^2, periodic.
+inline void Gresho(Params &pin, const Mesh &m, HostFields &h) {
+  const Real mach = pin.GetOrAddReal("problem", "mach", 0.1);
+  const Real gamma = pin.GetOrAddReal("mhd", "gamma", 5.0 / 3.0);
+  const Real p0 = 1.0 / (gamma * mach * mach);   // background pressure giving v_max/c_s = mach
+  for (int k = 0; k < m.nk + 1; ++k)
+    for (int j = 0; j < m.nj + 1; ++j)
+      for (int i = 0; i < m.ni + 1; ++i) { h.b1(k, j, i) = 0.0; h.b2(k, j, i) = 0.0; h.b3(k, j, i) = 0.0; }
+  for (int k = 0; k < m.nk; ++k)
+    for (int j = 0; j < m.nj; ++j)
+      for (int i = 0; i < m.ni; ++i) {
+        const Real x = m.x1v(i), y = m.two_d ? m.x2v(j) : 0.0;
+        const Real r = sqrt(x * x + y * y);
+        Real vphi, p;
+        if (r < 0.2) { vphi = 5.0 * r; p = p0 + 12.5 * r * r; }
+        else if (r < 0.4) { vphi = 2.0 - 5.0 * r; p = p0 + 12.5 * r * r - 20.0 * r + 4.0 * log(r / 0.2) + 4.0; }
+        else { vphi = 0.0; p = p0 - 2.0 + 4.0 * log(2.0); }
+        const Real ir = (r > 1e-14) ? 1.0 / r : 0.0;
+        h.w(IDN, k, j, i) = 1.0;
+        h.w(IVX, k, j, i) = -vphi * y * ir;
+        h.w(IVY, k, j, i) = vphi * x * ir;
+        h.w(IVZ, k, j, i) = 0.0;
+        h.w(IPR, k, j, i) = p;
+      }
+}
+
 // Uniform state (tests of gravity and cooling): rho, p, v, B constant.
 inline void Uniform(Params &pin, const Mesh &m, HostFields &h) {
   const Real d = pin.GetOrAddReal("problem", "dens", 1.0), p = pin.GetOrAddReal("problem", "pres", 1.0);
@@ -244,6 +273,7 @@ inline void Initialize(const std::string &name, Params &pin, Mesh &m, const Conf
   else if (name == "field_loop") FieldLoop(pin, m, h);
   else if (name == "shock_tube") ShockTube(pin, m, h);
   else if (name == "uniform") Uniform(pin, m, h);
+  else if (name == "gresho") Gresho(pin, m, h);
   else if (name == "diffusion_test") DiffusionTest(pin, m, h);
   else throw std::runtime_error("unknown problem: " + name);
 

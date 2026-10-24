@@ -31,8 +31,8 @@ using Range3 = Kokkos::MDRangePolicy<ExecSpace, Kokkos::Rank<3, Kokkos::Iterate:
 KOKKOS_INLINE_FUNCTION Real SQR(Real x) { return x * x; }
 KOKKOS_INLINE_FUNCTION Real SIGN(Real x) { return (x > Real(0)) ? Real(1) : ((x < Real(0)) ? Real(-1) : Real(0)); }
 
-enum class Recon : int { dc = 0, plm = 1, ppm = 2, wenoz = 3 };
-enum class Integrator : int { rk1 = 1, rk2 = 2, rk3 = 3 };
+enum class Recon : int { dc = 0, plm = 1, ppm = 2, wenoz = 3, ppmx = 4 };
+enum class Integrator : int { rk1 = 1, rk2 = 2, rk3 = 3, rk4 = 4 };   // rk4 = SSPRK(4,3), CFL coefficient 2
 enum class BCType : int { periodic = 0, outflow = 1, reflect = 2 };
 
 struct EOS {

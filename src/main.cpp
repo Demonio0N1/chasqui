@@ -102,13 +102,16 @@ int main(int argc, char *argv[]) {
   {
     const std::string r = pin.GetOrAddString("mhd", "reconstruct", "ppm");
     cfg.recon = (r == "dc") ? Recon::dc : (r == "plm") ? Recon::plm : (r == "ppm") ? Recon::ppm
-              : (r == "wenoz") ? Recon::wenoz : throw std::runtime_error("unknown reconstruct: " + r);
+              : (r == "ppmx") ? Recon::ppmx : (r == "wenoz") ? Recon::wenoz
+              : throw std::runtime_error("unknown reconstruct: " + r);
     const std::string s = pin.GetOrAddString("mhd", "rsolver", "hlld");
     cfg.rsolver = (s == "hlld") ? RSolver::hlld : (s == "hlle") ? RSolver::hlle
                 : throw std::runtime_error("unknown rsolver: " + s);
     const std::string t = pin.GetOrAddString("time", "integrator", "rk3");
     cfg.integ = (t == "rk1") ? Integrator::rk1 : (t == "rk2") ? Integrator::rk2 : (t == "rk3") ? Integrator::rk3
-              : throw std::runtime_error("unknown integrator: " + t);
+              : (t == "rk4" || t == "ssprk43") ? Integrator::rk4 : throw std::runtime_error("unknown integrator: " + t);
+    cfg.low_mach = pin.GetOrAddBool("mhd", "low_mach", false);
+    cfg.flatten = pin.GetOrAddBool("mhd", "flatten", true);
     cfg.cfl = pin.GetOrAddReal("time", "cfl", 0.3);
     cfg.eos.gamma = pin.GetOrAddReal("mhd", "gamma", 5.0 / 3.0);
     cfg.eos.gm1 = cfg.eos.gamma - 1.0;
@@ -144,7 +147,7 @@ int main(int argc, char *argv[]) {
   m.nx1 = pin.GetInt("mesh", "nx1");
   m.nx2 = pin.GetOrAddInt("mesh", "nx2", 1);
   m.nx3 = pin.GetOrAddInt("mesh", "nx3", 1);
-  const int ng_min = (cfg.recon == Recon::ppm || cfg.recon == Recon::wenoz) ? 3 : 2;
+  const int ng_min = (cfg.recon == Recon::ppm || cfg.recon == Recon::ppmx || cfg.recon == Recon::wenoz) ? 3 : 2;
   m.ng = pin.GetOrAddInt("mesh", "nghost", ng_min);
   if (m.ng < ng_min) throw std::runtime_error("nghost too small for the reconstruction method");
   m.x1min = pin.GetOrAddReal("mesh", "x1min", 0.0); m.x1max = pin.GetOrAddReal("mesh", "x1max", 1.0);
@@ -232,10 +235,17 @@ int main(int argc, char *argv[]) {
       else if (nstage == 2) {
         if (s == 1) { g0 = 1; g1 = 0; beta = 1; cur_u1 = false; out_u1 = true; }
         else        { g0 = 0.5; g1 = 0.5; beta = 0.5; cur_u1 = true; out_u1 = false; }
-      } else {
+      } else if (nstage == 3) {
         if (s == 1)      { g0 = 1; g1 = 0; beta = 1; cur_u1 = false; out_u1 = true; }
         else if (s == 2) { g0 = 0.75; g1 = 0.25; beta = 0.25; cur_u1 = true; out_u1 = true; }
         else             { g0 = 1.0 / 3.0; g1 = 2.0 / 3.0; beta = 2.0 / 3.0; cur_u1 = true; out_u1 = false; }
+      } else {
+        // SSPRK(4,3) of Spiteri & Ruuth (2002): third order, SSP coefficient 2, i.e. stable
+        // up to twice the CFL number of SSPRK(3,3) at four stages per step (1.5x cheaper).
+        if (s == 1)      { g0 = 1; g1 = 0; beta = 0.5; cur_u1 = false; out_u1 = true; }
+        else if (s == 2) { g0 = 0; g1 = 1; beta = 0.5; cur_u1 = true; out_u1 = true; }
+        else if (s == 3) { g0 = 2.0 / 3.0; g1 = 1.0 / 3.0; beta = 1.0 / 6.0; cur_u1 = true; out_u1 = true; }
+        else             { g0 = 0; g1 = 1; beta = 0.5; cur_u1 = true; out_u1 = false; }
       }
       const bool last = (s == nstage);
       Stage(m, ph, cur_u1, out_u1, g0, g1, beta * dt);

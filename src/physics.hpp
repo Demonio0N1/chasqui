@@ -24,6 +24,8 @@ struct Config {
   Integrator integ = Integrator::rk3;
   EOS eos{};
   Real cfl = Real(0.3);
+  bool low_mach = false;   // Thornber et al. (2008) low-Mach correction of the face velocities
+  bool flatten = true;     // Colella-Woodward shock flattening for ppm/ppmx/wenoz
   BCType bc1 = BCType::periodic, bc2 = BCType::periodic, bc3 = BCType::periodic;
 };
 
@@ -58,6 +60,8 @@ template <int DIR, Recon R, RSolver S>
 void Fluxes(const Mesh &m, const Config &cfg, Arr3 bn) {
   const Geom g(m);
   const EOS eos = cfg.eos;
+  const bool low_mach = cfg.low_mach;
+  const bool flatten = cfg.flatten && (R != Recon::dc && R != Recon::plm);
   constexpr int di = (DIR == 0) ? 1 : 0, dj = (DIR == 1) ? 1 : 0, dk = (DIR == 2) ? 1 : 0;
   constexpr int IVU = IVX + DIR, IVV = IVX + (DIR + 1) % 3, IVW = IVX + (DIR + 2) % 3;
   constexpr int IBT1 = (DIR + 1) % 3, IBT2 = (DIR + 2) % 3;
@@ -85,17 +89,32 @@ void Fluxes(const Mesh &m, const Config &cfg, Arr3 bn) {
       const Real dl_dc = q[2], dr_dc = q[3];
       LoadStencil<R>(w, IVU, k, j, i, dk, dj, di, q); recon::Face<R>(q, ql, qr);
       L.u = ql; Rr.u = qr; const Real ul_dc = q[2], ur_dc = q[3];
+      Real qu[6]; for (int s = 0; s < 6; ++s) qu[s] = q[s];
       LoadStencil<R>(w, IVV, k, j, i, dk, dj, di, q); recon::Face<R>(q, ql, qr);
       L.v = ql; Rr.v = qr; const Real vl_dc = q[2], vr_dc = q[3];
       LoadStencil<R>(w, IVW, k, j, i, dk, dj, di, q); recon::Face<R>(q, ql, qr);
       L.w = ql; Rr.w = qr; const Real wl_dc = q[2], wr_dc = q[3];
       LoadStencil<R>(w, IPR, k, j, i, dk, dj, di, q); recon::Face<R>(q, ql, qr);
       L.p = ql; Rr.p = qr; const Real pl_dc = q[2], pr_dc = q[3];
+      Real qp[6]; for (int s = 0; s < 6; ++s) qp[s] = q[s];
       // transverse magnetic fields (cell-centered)
       LoadStencil<R>(bcc, IBT1, k, j, i, dk, dj, di, q); recon::Face<R>(q, ql, qr);
       L.by = ql; Rr.by = qr; const Real byl_dc = q[2], byr_dc = q[3];
       LoadStencil<R>(bcc, IBT2, k, j, i, dk, dj, di, q); recon::Face<R>(q, ql, qr);
       L.bz = ql; Rr.bz = qr; const Real bzl_dc = q[2], bzr_dc = q[3];
+      if (flatten) {
+        // flattening coefficients of cell i-1 (stencil i-3..i+1) and cell i (i-2..i+2)
+        const Real fL = recon::Flattening(&qp[0], qu[1], qu[3]);
+        const Real fR = recon::Flattening(&qp[1], qu[2], qu[4]);
+        if (fL > Real(0)) {
+          L.d += fL * (dl_dc - L.d); L.u += fL * (ul_dc - L.u); L.v += fL * (vl_dc - L.v); L.w += fL * (wl_dc - L.w);
+          L.p += fL * (pl_dc - L.p); L.by += fL * (byl_dc - L.by); L.bz += fL * (bzl_dc - L.bz);
+        }
+        if (fR > Real(0)) {
+          Rr.d += fR * (dr_dc - Rr.d); Rr.u += fR * (ur_dc - Rr.u); Rr.v += fR * (vr_dc - Rr.v); Rr.w += fR * (wr_dc - Rr.w);
+          Rr.p += fR * (pr_dc - Rr.p); Rr.by += fR * (byr_dc - Rr.by); Rr.bz += fR * (bzr_dc - Rr.bz);
+        }
+      }
       // positivity: fall back to donor cell on a side that reconstructed to rho<=0 or p<=0
       if (L.d <= eos.dfloor || L.p <= eos.pfloor) {
         L.d = dl_dc; L.u = ul_dc; L.v = vl_dc; L.w = wl_dc; L.p = pl_dc; L.by = byl_dc; L.bz = bzl_dc;
@@ -104,6 +123,15 @@ void Fluxes(const Mesh &m, const Config &cfg, Arr3 bn) {
         Rr.d = dr_dc; Rr.u = ur_dc; Rr.v = vr_dc; Rr.w = wr_dc; Rr.p = pr_dc; Rr.by = byr_dc; Rr.bz = bzr_dc;
       }
       const Real b_n = bn(k, j, i);
+      if (low_mach) {
+        // z = min(1, max(M_L, M_R)) with the fast magnetosonic Mach number; blends the normal
+        // velocities so that the pressure-dissipation of the Riemann solver scales with the
+        // Mach number instead of staying O(1) at low speeds (Thornber et al. 2008).
+        const Real cl = FastSpeed(L, b_n, eos.gamma), cr = FastSpeed(Rr, b_n, eos.gamma);
+        const Real z = fmin(Real(1), fmax(fabs(L.u) / cl, fabs(Rr.u) / cr));
+        const Real um = Real(0.5) * (L.u + Rr.u), ud = Real(0.5) * (z * (L.u - Rr.u));
+        L.u = um + ud; Rr.u = um - ud;
+      }
       Real f[NFLX];
       if constexpr (S == RSolver::hlld) HLLD(L, Rr, b_n, eos, f);
       else HLLE(L, Rr, b_n, eos, f);
@@ -382,6 +410,9 @@ void FluxesDispatch(const Mesh &m, const Config &cfg, Arr3 bn) {
       break;
     case Recon::ppm:
       if (hlld) Fluxes<DIR, Recon::ppm, RSolver::hlld>(m, cfg, bn); else Fluxes<DIR, Recon::ppm, RSolver::hlle>(m, cfg, bn);
+      break;
+    case Recon::ppmx:
+      if (hlld) Fluxes<DIR, Recon::ppmx, RSolver::hlld>(m, cfg, bn); else Fluxes<DIR, Recon::ppmx, RSolver::hlle>(m, cfg, bn);
       break;
     default:
       if (hlld) Fluxes<DIR, Recon::wenoz, RSolver::hlld>(m, cfg, bn); else Fluxes<DIR, Recon::wenoz, RSolver::hlle>(m, cfg, bn);
