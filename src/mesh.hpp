@@ -31,6 +31,8 @@ struct Mesh {
   Arr3 e2x1, e3x1, e1x2, e3x2, e1x3, e2x3;
   // edge-centered EMFs used by CT
   Arr3 e1, e2, e3;
+  // first-order flux-correction flags (1 = cell needs first-order fluxes)
+  Kokkos::View<int***, Layout> flag;
 
   void Allocate() {
     ni = nx1 + 2 * ng;
@@ -57,6 +59,7 @@ struct Mesh {
     e1x2 = Arr3("e1x2", nkp, njp, nip); e3x2 = Arr3("e3x2", nkp, njp, nip);
     e1x3 = Arr3("e1x3", nkp, njp, nip); e2x3 = Arr3("e2x3", nkp, njp, nip);
     e1 = Arr3("e1", nkp, njp, nip); e2 = Arr3("e2", nkp, njp, nip); e3 = Arr3("e3", nkp, njp, nip);
+    flag = Kokkos::View<int***, Layout>("flag", nk, nj, ni);
   }
 
   // cell-center and face coordinates

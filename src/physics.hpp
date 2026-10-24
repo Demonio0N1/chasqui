@@ -117,6 +117,16 @@ void Fluxes(const Mesh &m, const Config &cfg, Arr3 bn) {
     });
 }
 
+// Upwind selection used by the corner-EMF algorithm: the derivative is taken from the
+// upwind side of the mass flux; when the flux is exactly zero both sides are averaged, which
+// keeps mirror symmetry (Athena++ convention).
+// A mass flux below `tol` (round-off level in code units) counts as zero, so a mirror-
+// symmetric flow does not pick a random side on its symmetry plane and seed an asymmetry.
+KOKKOS_INLINE_FUNCTION Real Upwind(Real flux, Real left, Real right) {
+  constexpr Real tol = Real(1e-14);
+  return (flux > tol) ? left : (flux < -tol) ? right : Real(0.5) * (left + right);
+}
+
 // -----------------------------------------------------------------------------------------
 // Upwind corner EMFs (Gardiner & Stone 2005, eqs. 41-51 as formulated in Stone & Gardiner
 // 2009): E_edge = 1/4 (sum of 4 face EMFs) + upwind-selected derivative corrections built
@@ -147,45 +157,34 @@ inline void CornerEMF(const Mesh &m) {
     // E1 on x1-edges: (k-1/2, j-1/2, i)
     Kokkos::parallel_for("corner_e1", Range3({ks, js, is}, {ke + 2, je + 2, ie + 1}),
       KOKKOS_LAMBDA(const int k, const int j, const int i) {
-        const Real l3 = (f2(IDN, k - 1, j, i) >= Real(0)) ? e1x3(k, j - 1, i) - ecc(0, k - 1, j - 1, i)
-                                                          : e1x3(k, j, i) - ecc(0, k - 1, j, i);
-        const Real r3 = (f2(IDN, k, j, i) >= Real(0)) ? e1x3(k, j - 1, i) - ecc(0, k, j - 1, i)
-                                                      : e1x3(k, j, i) - ecc(0, k, j, i);
-        const Real l2 = (f3(IDN, k, j - 1, i) >= Real(0)) ? e1x2(k - 1, j, i) - ecc(0, k - 1, j - 1, i)
-                                                          : e1x2(k, j, i) - ecc(0, k, j - 1, i);
-        const Real r2 = (f3(IDN, k, j, i) >= Real(0)) ? e1x2(k - 1, j, i) - ecc(0, k - 1, j, i)
-                                                      : e1x2(k, j, i) - ecc(0, k, j, i);
-        e1(k, j, i) = Real(0.25) * (l3 + r3 + l2 + r2 + e1x2(k - 1, j, i) + e1x2(k, j, i)
-                                    + e1x3(k, j - 1, i) + e1x3(k, j, i));
+        const Real l3 = Upwind(f2(IDN, k - 1, j, i), e1x3(k, j - 1, i) - ecc(0, k - 1, j - 1, i), e1x3(k, j, i) - ecc(0, k - 1, j, i));
+        const Real r3 = Upwind(f2(IDN, k, j, i), e1x3(k, j - 1, i) - ecc(0, k, j - 1, i), e1x3(k, j, i) - ecc(0, k, j, i));
+        const Real l2 = Upwind(f3(IDN, k, j - 1, i), e1x2(k - 1, j, i) - ecc(0, k - 1, j - 1, i), e1x2(k, j, i) - ecc(0, k, j - 1, i));
+        const Real r2 = Upwind(f3(IDN, k, j, i), e1x2(k - 1, j, i) - ecc(0, k - 1, j, i), e1x2(k, j, i) - ecc(0, k, j, i));
+        // (pairwise sums keep the result bitwise mirror-symmetric)
+        e1(k, j, i) = Real(0.25) * (((l3 + r3) + (l2 + r2))
+                                    + ((e1x2(k - 1, j, i) + e1x2(k, j, i)) + (e1x3(k, j - 1, i) + e1x3(k, j, i))));
       });
     // E2 on x2-edges: (k-1/2, j, i-1/2)
     Kokkos::parallel_for("corner_e2", Range3({ks, js, is}, {ke + 2, je + 1, ie + 2}),
       KOKKOS_LAMBDA(const int k, const int j, const int i) {
-        const Real l3 = (f1(IDN, k - 1, j, i) >= Real(0)) ? e2x3(k, j, i - 1) - ecc(1, k - 1, j, i - 1)
-                                                          : e2x3(k, j, i) - ecc(1, k - 1, j, i);
-        const Real r3 = (f1(IDN, k, j, i) >= Real(0)) ? e2x3(k, j, i - 1) - ecc(1, k, j, i - 1)
-                                                      : e2x3(k, j, i) - ecc(1, k, j, i);
-        const Real l1 = (f3(IDN, k, j, i - 1) >= Real(0)) ? e2x1(k - 1, j, i) - ecc(1, k - 1, j, i - 1)
-                                                          : e2x1(k, j, i) - ecc(1, k, j, i - 1);
-        const Real r1 = (f3(IDN, k, j, i) >= Real(0)) ? e2x1(k - 1, j, i) - ecc(1, k - 1, j, i)
-                                                      : e2x1(k, j, i) - ecc(1, k, j, i);
-        e2(k, j, i) = Real(0.25) * (l3 + r3 + l1 + r1 + e2x3(k, j, i - 1) + e2x3(k, j, i)
-                                    + e2x1(k - 1, j, i) + e2x1(k, j, i));
+        const Real l3 = Upwind(f1(IDN, k - 1, j, i), e2x3(k, j, i - 1) - ecc(1, k - 1, j, i - 1), e2x3(k, j, i) - ecc(1, k - 1, j, i));
+        const Real r3 = Upwind(f1(IDN, k, j, i), e2x3(k, j, i - 1) - ecc(1, k, j, i - 1), e2x3(k, j, i) - ecc(1, k, j, i));
+        const Real l1 = Upwind(f3(IDN, k, j, i - 1), e2x1(k - 1, j, i) - ecc(1, k - 1, j, i - 1), e2x1(k, j, i) - ecc(1, k, j, i - 1));
+        const Real r1 = Upwind(f3(IDN, k, j, i), e2x1(k - 1, j, i) - ecc(1, k - 1, j, i), e2x1(k, j, i) - ecc(1, k, j, i));
+        e2(k, j, i) = Real(0.25) * (((l3 + r3) + (l1 + r1))
+                                    + ((e2x3(k, j, i - 1) + e2x3(k, j, i)) + (e2x1(k - 1, j, i) + e2x1(k, j, i))));
       });
   }
   // E3 on x3-edges: (k, j-1/2, i-1/2)  (2D and 3D)
   Kokkos::parallel_for("corner_e3", Range3({ks, js, is}, {ke + 1, je + 2, ie + 2}),
     KOKKOS_LAMBDA(const int k, const int j, const int i) {
-      const Real l2 = (f1(IDN, k, j - 1, i) >= Real(0)) ? e3x2(k, j, i - 1) - ecc(2, k, j - 1, i - 1)
-                                                        : e3x2(k, j, i) - ecc(2, k, j - 1, i);
-      const Real r2 = (f1(IDN, k, j, i) >= Real(0)) ? e3x2(k, j, i - 1) - ecc(2, k, j, i - 1)
-                                                    : e3x2(k, j, i) - ecc(2, k, j, i);
-      const Real l1 = (f2(IDN, k, j, i - 1) >= Real(0)) ? e3x1(k, j - 1, i) - ecc(2, k, j - 1, i - 1)
-                                                        : e3x1(k, j, i) - ecc(2, k, j, i - 1);
-      const Real r1 = (f2(IDN, k, j, i) >= Real(0)) ? e3x1(k, j - 1, i) - ecc(2, k, j - 1, i)
-                                                    : e3x1(k, j, i) - ecc(2, k, j, i);
-      e3(k, j, i) = Real(0.25) * (l2 + r2 + l1 + r1 + e3x2(k, j, i - 1) + e3x2(k, j, i)
-                                  + e3x1(k, j - 1, i) + e3x1(k, j, i));
+      const Real l2 = Upwind(f1(IDN, k, j - 1, i), e3x2(k, j, i - 1) - ecc(2, k, j - 1, i - 1), e3x2(k, j, i) - ecc(2, k, j - 1, i));
+      const Real r2 = Upwind(f1(IDN, k, j, i), e3x2(k, j, i - 1) - ecc(2, k, j, i - 1), e3x2(k, j, i) - ecc(2, k, j, i));
+      const Real l1 = Upwind(f2(IDN, k, j, i - 1), e3x1(k, j - 1, i) - ecc(2, k, j - 1, i - 1), e3x1(k, j, i) - ecc(2, k, j, i - 1));
+      const Real r1 = Upwind(f2(IDN, k, j, i), e3x1(k, j - 1, i) - ecc(2, k, j - 1, i), e3x1(k, j, i) - ecc(2, k, j, i));
+      e3(k, j, i) = Real(0.25) * (((l2 + r2) + (l1 + r1))
+                                  + ((e3x2(k, j, i - 1) + e3x2(k, j, i)) + (e3x1(k, j - 1, i) + e3x1(k, j, i))));
     });
 }
 
@@ -241,7 +240,9 @@ inline void Update(const Mesh &m, const StageArrays &s, Real g0, Real g1, Real b
 }
 
 // -----------------------------------------------------------------------------------------
-// Boundary conditions on conserved variables and face fields.
+// Boundary conditions on conserved variables and face fields: periodic, outflow (zero
+// gradient) and reflect (mirror; normal momentum and normal B change sign, so B_n = 0 and
+// v_n = 0 on the wall).
 inline void Boundaries(const Mesh &m, const Config &cfg, Arr4 u, Arr3 b1, Arr3 b2, Arr3 b3) {
   const int ng = m.ng, nx1 = m.nx1, nx2 = m.nx2, nx3 = m.nx3;
   const int is = m.is, ie = m.ie, js = m.js, je = m.je, ks = m.ks, ke = m.ke;
@@ -249,62 +250,75 @@ inline void Boundaries(const Mesh &m, const Config &cfg, Arr4 u, Arr3 b1, Arr3 b
 
   // ---- x1 ----
   {
-    const bool per = (cfg.bc1 == BCType::periodic);
+    const int bc = static_cast<int>(cfg.bc1);   // 0 periodic, 1 outflow, 2 reflect
     Kokkos::parallel_for("bc_x1", Range3({0, 0, 0}, {nk + 1, nj + 1, ng}),
       KOKKOS_LAMBDA(const int k, const int j, const int g) {
         const int il = g, ir = ie + 1 + g;             // ghost cells left / right
-        const int srcl = per ? il + nx1 : is;
-        const int srcr = per ? ir - nx1 : ie;
+        const int srcl = (bc == 0) ? il + nx1 : (bc == 1) ? is : 2 * is - 1 - il;
+        const int srcr = (bc == 0) ? ir - nx1 : (bc == 1) ? ie : 2 * ie + 1 - ir;
+        const Real sgn = (bc == 2) ? Real(-1) : Real(1);
         if (k < nk && j < nj) {
-          for (int n = 0; n < NVAR; ++n) { u(n, k, j, il) = u(n, k, j, srcl); u(n, k, j, ir) = u(n, k, j, srcr); }
+          for (int n = 0; n < NVAR; ++n) {
+            const Real f = (n == IM1) ? sgn : Real(1);
+            u(n, k, j, il) = f * u(n, k, j, srcl); u(n, k, j, ir) = f * u(n, k, j, srcr);
+          }
           b2(k, j, il) = b2(k, j, srcl); b2(k, j, ir) = b2(k, j, srcr);
           b3(k, j, il) = b3(k, j, srcl); b3(k, j, ir) = b3(k, j, srcr);
         }
-        // face-normal field: ghost faces il (left) and ir+1 (right)
+        // face-normal field: ghost faces fl (left of face is) and fr (right of face ie+1)
         const int fl = g, fr = ie + 2 + g;
-        b1(k, j, fl) = per ? b1(k, j, fl + nx1) : b1(k, j, is);
-        b1(k, j, fr) = per ? b1(k, j, fr - nx1) : b1(k, j, ie + 1);
-        if (per && g == 0) b1(k, j, ie + 1) = b1(k, j, is);   // shared periodic face
+        if (bc == 0)      { b1(k, j, fl) = b1(k, j, fl + nx1); b1(k, j, fr) = b1(k, j, fr - nx1); }
+        else if (bc == 1) { b1(k, j, fl) = b1(k, j, is);       b1(k, j, fr) = b1(k, j, ie + 1); }
+        else              { b1(k, j, fl) = -b1(k, j, 2 * is - fl); b1(k, j, fr) = -b1(k, j, 2 * (ie + 1) - fr); }
+        if (bc == 0 && g == 0) b1(k, j, ie + 1) = b1(k, j, is);   // shared periodic face
       });
   }
   // ---- x2 ----
   if (m.two_d) {
-    const bool per = (cfg.bc2 == BCType::periodic);
+    const int bc = static_cast<int>(cfg.bc2);
     Kokkos::parallel_for("bc_x2", Range3({0, 0, 0}, {nk + 1, ng, ni + 1}),
       KOKKOS_LAMBDA(const int k, const int g, const int i) {
         const int jl = g, jr = je + 1 + g;
-        const int srcl = per ? jl + nx2 : js;
-        const int srcr = per ? jr - nx2 : je;
+        const int srcl = (bc == 0) ? jl + nx2 : (bc == 1) ? js : 2 * js - 1 - jl;
+        const int srcr = (bc == 0) ? jr - nx2 : (bc == 1) ? je : 2 * je + 1 - jr;
+        const Real sgn = (bc == 2) ? Real(-1) : Real(1);
         if (k < nk && i < ni) {
-          for (int n = 0; n < NVAR; ++n) { u(n, k, jl, i) = u(n, k, srcl, i); u(n, k, jr, i) = u(n, k, srcr, i); }
-          b1(k, jl, i) = b1(k, srcl, i); b1(k, jr, i) = b1(k, srcr, i);
+          for (int n = 0; n < NVAR; ++n) {
+            const Real f = (n == IM2) ? sgn : Real(1);
+            u(n, k, jl, i) = f * u(n, k, srcl, i); u(n, k, jr, i) = f * u(n, k, srcr, i);
+          }
           b3(k, jl, i) = b3(k, srcl, i); b3(k, jr, i) = b3(k, srcr, i);
         }
-        // b1 also has the extra face i = ni
-        if (k < nk && i == ni) { b1(k, jl, i) = b1(k, srcl, i); b1(k, jr, i) = b1(k, srcr, i); }
+        if (k < nk) { b1(k, jl, i) = b1(k, srcl, i); b1(k, jr, i) = b1(k, srcr, i); }   // b1 has i = ni too
         const int fl = g, fr = je + 2 + g;
-        b2(k, fl, i) = per ? b2(k, fl + nx2, i) : b2(k, js, i);
-        b2(k, fr, i) = per ? b2(k, fr - nx2, i) : b2(k, je + 1, i);
-        if (per && g == 0) b2(k, je + 1, i) = b2(k, js, i);
+        if (bc == 0)      { b2(k, fl, i) = b2(k, fl + nx2, i); b2(k, fr, i) = b2(k, fr - nx2, i); }
+        else if (bc == 1) { b2(k, fl, i) = b2(k, js, i);       b2(k, fr, i) = b2(k, je + 1, i); }
+        else              { b2(k, fl, i) = -b2(k, 2 * js - fl, i); b2(k, fr, i) = -b2(k, 2 * (je + 1) - fr, i); }
+        if (bc == 0 && g == 0) b2(k, je + 1, i) = b2(k, js, i);
       });
   }
   // ---- x3 ----
   if (m.three_d) {
-    const bool per = (cfg.bc3 == BCType::periodic);
+    const int bc = static_cast<int>(cfg.bc3);
     Kokkos::parallel_for("bc_x3", Range3({0, 0, 0}, {ng, nj + 1, ni + 1}),
       KOKKOS_LAMBDA(const int g, const int j, const int i) {
         const int kl = g, kr = ke + 1 + g;
-        const int srcl = per ? kl + nx3 : ks;
-        const int srcr = per ? kr - nx3 : ke;
+        const int srcl = (bc == 0) ? kl + nx3 : (bc == 1) ? ks : 2 * ks - 1 - kl;
+        const int srcr = (bc == 0) ? kr - nx3 : (bc == 1) ? ke : 2 * ke + 1 - kr;
+        const Real sgn = (bc == 2) ? Real(-1) : Real(1);
         if (j < nj && i < ni) {
-          for (int n = 0; n < NVAR; ++n) { u(n, kl, j, i) = u(n, srcl, j, i); u(n, kr, j, i) = u(n, srcr, j, i); }
+          for (int n = 0; n < NVAR; ++n) {
+            const Real f = (n == IM3) ? sgn : Real(1);
+            u(n, kl, j, i) = f * u(n, srcl, j, i); u(n, kr, j, i) = f * u(n, srcr, j, i);
+          }
         }
         b1(kl, j, i) = b1(srcl, j, i); b1(kr, j, i) = b1(srcr, j, i);
         b2(kl, j, i) = b2(srcl, j, i); b2(kr, j, i) = b2(srcr, j, i);
         const int fl = g, fr = ke + 2 + g;
-        b3(fl, j, i) = per ? b3(fl + nx3, j, i) : b3(ks, j, i);
-        b3(fr, j, i) = per ? b3(fr - nx3, j, i) : b3(ke + 1, j, i);
-        if (per && g == 0) b3(ke + 1, j, i) = b3(ks, j, i);
+        if (bc == 0)      { b3(fl, j, i) = b3(fl + nx3, j, i); b3(fr, j, i) = b3(fr - nx3, j, i); }
+        else if (bc == 1) { b3(fl, j, i) = b3(ks, j, i);       b3(fr, j, i) = b3(ke + 1, j, i); }
+        else              { b3(fl, j, i) = -b3(2 * ks - fl, j, i); b3(fr, j, i) = -b3(2 * (ke + 1) - fr, j, i); }
+        if (bc == 0 && g == 0) b3(ke + 1, j, i) = b3(ks, j, i);
       });
   }
 }

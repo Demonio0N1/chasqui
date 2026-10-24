@@ -85,21 +85,46 @@ cara→centro de B y la EMF de esquina son de 2.º orden, como en Athena++). 3D:
 ∇·B ≤ 5e-13 y energía total constante a 1e-12 en todas las corridas (CPAW 3D, Orszag-Tang,
 Brio-Wu, blast MHD 3D).
 
+## Física
+
+| Módulo | Bloque del input | Validación (`tests/physics.sh`) |
+|---|---|---|
+| MHD ideal (3D, CT) | `[mhd]` | convergencia CPAW, Orszag-Tang, Brio-Wu, blast |
+| Resistividad óhmica η (EMF = ηJ en aristas + calentamiento óhmico) | `[diffusion] eta` | decaimiento exacto `exp(-η k² t)` en x, y, z: error 3e-4 |
+| Viscosidad ν (tensor Navier-Stokes isótropo, μ = ρν) | `[diffusion] nu` | decaimiento exacto en x, y, z: error 3e-4 |
+| Conducción térmica κ (q = −κ∇T) | `[diffusion] kappa` | difusividad isóbara κ/(ρ c_p): error 2e-3 |
+| Gravedad uniforme y de masa puntual (suavizada) | `[gravity]` | momento ρ g t V exacto |
+| Enfriamiento ópticamente delgado Λ = Λ₀Tᵅ, integrado exactamente | `[cooling]` | T(t) exacta a 3e-8 |
+| Fronteras: periódicas, *outflow*, reflectantes | `[mesh] bc_x1..3` | masa y energía conservadas a 1e-12 en caja cerrada |
+| Corrección de flujo de primer orden (positividad) | `[mhd] fofc` | se activa solo en celdas con ρ o p bajo el piso |
+| Reinicios binarios | `[output] rst_dt`, `-r fichero` | reanudación *bitwise* |
+
+Los términos difusivos se suman a los flujos/EMF de la misma etapa RK (explícitos), con el
+límite parabólico de paso de tiempo `dt ≤ cfl·dx²/(2·ndim·max(ν, η, χ))`.
+
+Limitaciones conocidas:
+- Las paredes reflectantes requieren B normal nulo en la pared (como en Athena++); con
+  B_n ≠ 0 no son un espejo y no conservan masa.
+- PLM + HLLE es *bitwise* simétrico bajo reflexiones; PPM, WENO-Z y HLLD introducen
+  asimetrías de 10⁻¹⁶ que un flujo inestable (p. ej. la cáscara de un blast) amplifica,
+  igual que en cualquier otro código.
+- Sin MPI, sin AMR, sin geometrías curvilíneas, sin EOS no ideales todavía.
+
 ## Problemas incluidos
 
-`cpaw` (onda de Alfvén, cualquier ángulo en x-y), `orszag_tang`, `brio_wu`/`shock_tube`,
-`field_loop`, `blast`. Añadir uno nuevo = una función en `src/pgen.hpp` que llene
-primitivas y campos de cara (hay un ayudante para inicializar B desde un potencial vector,
-que garantiza ∇·B = 0 a nivel de redondeo).
+`cpaw` (onda de Alfvén, cualquier ángulo en x-y), `orszag_tang`, `shock_tube` (Brio-Wu),
+`field_loop`, `blast`, `uniform`, `diffusion_test`. Añadir uno nuevo = una función en
+`src/pgen.hpp` que llene primitivas y campos de cara (hay un ayudante para inicializar B
+desde un potencial vector, que garantiza ∇·B = 0 a nivel de redondeo).
 
 ## Hoja de ruta
 
 - [ ] Medir en GPU (RTX 4090) contra AthenaK en el mismo problema.
-- [ ] Reconstrucción característica para WENO-Z (menos oscilaciones en choques fuertes).
-- [ ] Límite extremo-preservante para PPM (Colella & Sekora 2008).
-- [ ] Corrección de flujo de primer orden como red de seguridad.
 - [ ] MPI (descomposición de dominio) y salida HDF5.
-- [ ] Fronteras reflectantes y definidas por el usuario; términos fuente.
+- [ ] EOS isoterma y general; conducción anisótropa (a lo largo de B).
+- [ ] Reconstrucción característica para WENO-Z; límite extremo-preservante para PPM.
+- [ ] Fronteras definidas por el usuario; términos fuente de usuario; escalares pasivos.
+- [ ] Vectorización del bucle interno en CPU.
 
 ## Licencia
 

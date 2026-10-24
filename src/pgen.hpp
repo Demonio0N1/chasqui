@@ -116,7 +116,9 @@ inline void Blast(Params &pin, const Mesh &m, HostFields &h) {
   const Real rad = pin.GetOrAddReal("problem", "radius", 0.1);
   const Real b0 = pin.GetOrAddReal("problem", "b0", 1.0);
   const Real ang = pin.GetOrAddReal("problem", "angle", 45.0) * PI / 180.0;
-  const Real bx = b0 * cos(ang), by = b0 * sin(ang);
+  Real bx = b0 * cos(ang), by = b0 * sin(ang);
+  if (fabs(bx) < 1e-14 * b0) bx = 0.0;   // cos(90 deg) is 6e-17, not 0: keep exact symmetry
+  if (fabs(by) < 1e-14 * b0) by = 0.0;
   for (int k = 0; k < m.nk + 1; ++k)
     for (int j = 0; j < m.nj + 1; ++j)
       for (int i = 0; i < m.ni + 1; ++i) { h.b1(k, j, i) = bx; h.b2(k, j, i) = by; h.b3(k, j, i) = 0.0; }
@@ -175,6 +177,59 @@ inline void ShockTube(Params &pin, const Mesh &m, HostFields &h) {
       }
 }
 
+
+// Uniform state (tests of gravity and cooling): rho, p, v, B constant.
+inline void Uniform(Params &pin, const Mesh &m, HostFields &h) {
+  const Real d = pin.GetOrAddReal("problem", "dens", 1.0), p = pin.GetOrAddReal("problem", "pres", 1.0);
+  const Real vx = pin.GetOrAddReal("problem", "vx", 0.0), vy = pin.GetOrAddReal("problem", "vy", 0.0), vz = pin.GetOrAddReal("problem", "vz", 0.0);
+  const Real bx = pin.GetOrAddReal("problem", "bx", 0.0), by = pin.GetOrAddReal("problem", "by", 0.0), bz = pin.GetOrAddReal("problem", "bz", 0.0);
+  for (int k = 0; k < m.nk + 1; ++k)
+    for (int j = 0; j < m.nj + 1; ++j)
+      for (int i = 0; i < m.ni + 1; ++i) { h.b1(k, j, i) = bx; h.b2(k, j, i) = by; h.b3(k, j, i) = bz; }
+  for (int k = 0; k < m.nk; ++k)
+    for (int j = 0; j < m.nj; ++j)
+      for (int i = 0; i < m.ni; ++i) {
+        h.w(IDN, k, j, i) = d; h.w(IVX, k, j, i) = vx; h.w(IVY, k, j, i) = vy; h.w(IVZ, k, j, i) = vz; h.w(IPR, k, j, i) = p;
+      }
+}
+
+// Decay of a sinusoidal perturbation along one axis under one diffusive process (exact
+// solution amp * exp(-D k^2 t) for a small amplitude): var = "b" (resistivity, D = eta),
+// "v" (viscosity, D = nu) or "temp" (conduction, D = kappa (gamma-1)/rho). The perturbed
+// vector component is the one cyclically following the axis (axis 1 -> y, 2 -> z, 3 -> x).
+inline void DiffusionTest(Params &pin, const Mesh &m, HostFields &h) {
+  const std::string var = pin.GetOrAddString("problem", "var", "b");
+  const int axis = pin.GetOrAddInt("problem", "axis", 1);
+  const Real amp = pin.GetOrAddReal("problem", "amp", 1.0e-3);
+  const Real d0 = pin.GetOrAddReal("problem", "dens", 1.0), p0 = pin.GetOrAddReal("problem", "pres", 1.0);
+  const Real L = (axis == 1) ? (m.x1max - m.x1min) : (axis == 2) ? (m.x2max - m.x2min) : (m.x3max - m.x3min);
+  const Real k = 2.0 * PI / L;
+  const int comp = axis % 3;   // perturbed vector component index (0=x,1=y,2=z)
+  auto coord_v = [&](int kk, int j, int i) { return (axis == 1) ? m.x1v(i) : (axis == 2) ? m.x2v(j) : m.x3v(kk); };
+  for (int kk = 0; kk < m.nk + 1; ++kk)
+    for (int j = 0; j < m.nj + 1; ++j)
+      for (int i = 0; i < m.ni + 1; ++i) {
+        h.b1(kk, j, i) = 0.0; h.b2(kk, j, i) = 0.0; h.b3(kk, j, i) = 0.0;
+        if (var == "b") {
+          // face-centered B_comp as a function of the axis coordinate at that face's center
+          const Real xb = (axis == 1) ? m.x1v(i) : (axis == 2) ? m.x2v(j) : m.x3v(kk);
+          const Real val = amp * sin(k * xb);
+          if (comp == 0) h.b1(kk, j, i) = val; else if (comp == 1) h.b2(kk, j, i) = val; else h.b3(kk, j, i) = val;
+        }
+      }
+  for (int kk = 0; kk < m.nk; ++kk)
+    for (int j = 0; j < m.nj; ++j)
+      for (int i = 0; i < m.ni; ++i) {
+        const Real x = coord_v(kk, j, i);
+        Real d = d0, p = p0, v[3] = {0.0, 0.0, 0.0};
+        if (var == "v") v[comp] = amp * sin(k * x);
+        if (var == "temp") { const Real T = p0 / d0 + amp * sin(k * x); d = p0 / T; }   // uniform pressure
+        if (var == "b") p = p0 - 0.5 * SQR(amp * sin(k * x));                          // uniform total pressure
+        h.w(IDN, kk, j, i) = d; h.w(IVX, kk, j, i) = v[0]; h.w(IVY, kk, j, i) = v[1]; h.w(IVZ, kk, j, i) = v[2];
+        h.w(IPR, kk, j, i) = p;
+      }
+}
+
 // Fill primitives + faces on host, convert to conserved and copy to the device.
 inline void Initialize(const std::string &name, Params &pin, Mesh &m, const Config &cfg) {
   HostFields h;
@@ -188,6 +243,8 @@ inline void Initialize(const std::string &name, Params &pin, Mesh &m, const Conf
   else if (name == "blast") Blast(pin, m, h);
   else if (name == "field_loop") FieldLoop(pin, m, h);
   else if (name == "shock_tube") ShockTube(pin, m, h);
+  else if (name == "uniform") Uniform(pin, m, h);
+  else if (name == "diffusion_test") DiffusionTest(pin, m, h);
   else throw std::runtime_error("unknown problem: " + name);
 
   // conserved variables from primitives and face fields

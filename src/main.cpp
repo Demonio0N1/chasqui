@@ -1,6 +1,6 @@
 // Chasqui MHD — driver.
 //
-//   chasqui -i input.in [block.key=value ...]
+//   chasqui -i input.in [-r restart.rst] [block.key=value ...]
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -11,21 +11,35 @@
 #include "params.hpp"
 #include "mesh.hpp"
 #include "physics.hpp"
+#include "diffusion.hpp"
+#include "srcterms.hpp"
+#include "fofc.hpp"
 #include "pgen.hpp"
 #include "output.hpp"
+#include "restart.hpp"
 
 namespace {
 
 BCType ParseBC(const std::string &s) {
   if (s == "periodic") return BCType::periodic;
   if (s == "outflow") return BCType::outflow;
+  if (s == "reflect") return BCType::reflect;
   throw std::runtime_error("unknown boundary condition: " + s);
 }
 
-// One Runge-Kutta stage. `cur` is the state the primitives were computed from (u0/b0 on
-// stage 1, u1/b1 after), `out` the array receiving  g0*u0 + g1*u1 - beta*dt*L(cur).
-void Stage(Mesh &m, const Config &cfg, bool cur_is_u1, bool out_is_u1,
-           Real g0, Real g1, Real beta_dt, bool last) {
+struct Physics {
+  Config cfg;
+  diffusion::Coeffs diff;
+  srcterms::Gravity grav;
+  srcterms::Cooling cool;
+  bool fofc = false;
+  long fofc_count = 0;
+};
+
+// One Runge-Kutta stage: out = g0*u0 + g1*u1 - beta_dt * L(cur), where `cur` is the state
+// the primitives were computed from (u0/b0 on stage 1, u1/b1 afterwards).
+void Stage(Mesh &m, Physics &ph, bool cur_is_u1, bool out_is_u1, Real g0, Real g1, Real beta_dt) {
+  const Config &cfg = ph.cfg;
   Arr3 b1c = cur_is_u1 ? m.b1f1 : m.b1f0;
   Arr3 b2c = cur_is_u1 ? m.b2f1 : m.b2f0;
   Arr3 b3c = cur_is_u1 ? m.b3f1 : m.b3f0;
@@ -33,7 +47,11 @@ void Stage(Mesh &m, const Config &cfg, bool cur_is_u1, bool out_is_u1,
   kernels::FluxesDispatch<0>(m, cfg, b1c);
   if (m.two_d) kernels::FluxesDispatch<1>(m, cfg, b2c);
   if (m.three_d) kernels::FluxesDispatch<2>(m, cfg, b3c);
+  diffusion::Fluxes<0>(m, ph.diff, b1c, b2c, b3c);
+  if (m.two_d) diffusion::Fluxes<1>(m, ph.diff, b1c, b2c, b3c);
+  if (m.three_d) diffusion::Fluxes<2>(m, ph.diff, b1c, b2c, b3c);
   kernels::CornerEMF(m);
+  diffusion::ResistiveEMF(m, ph.diff, b1c, b2c, b3c);
 
   kernels::StageArrays s;
   s.ua = m.u0; s.ub = m.u1; s.uout = out_is_u1 ? m.u1 : m.u0;
@@ -43,8 +61,22 @@ void Stage(Mesh &m, const Config &cfg, bool cur_is_u1, bool out_is_u1,
   s.b2out = out_is_u1 ? m.b2f1 : m.b2f0;
   s.b3out = out_is_u1 ? m.b3f1 : m.b3f0;
   kernels::Update(m, s, g0, g1, beta_dt);
+  srcterms::ApplyGravity(m, ph.grav, s.uout, beta_dt);
+
+  if (ph.fofc) {
+    const int nbad = fofc::FlagBadCells(m, cfg, s.uout, s.b1out, s.b2out, s.b3out);
+    if (nbad > 0) {
+      ph.fofc_count += nbad;
+      fofc::RepairFluxes<0>(m, cfg, ph.diff, b1c, b2c, b3c);
+      if (m.two_d) fofc::RepairFluxes<1>(m, cfg, ph.diff, b1c, b2c, b3c);
+      if (m.three_d) fofc::RepairFluxes<2>(m, cfg, ph.diff, b1c, b2c, b3c);
+      kernels::CornerEMF(m);
+      diffusion::ResistiveEMF(m, ph.diff, b1c, b2c, b3c);
+      kernels::Update(m, s, g0, g1, beta_dt);
+      srcterms::ApplyGravity(m, ph.grav, s.uout, beta_dt);
+    }
+  }
   kernels::Boundaries(m, cfg, s.uout, s.b1out, s.b2out, s.b3out);
-  (void)last;
 }
 
 }  // namespace
@@ -52,19 +84,21 @@ void Stage(Mesh &m, const Config &cfg, bool cur_is_u1, bool out_is_u1,
 int main(int argc, char *argv[]) {
   Kokkos::ScopeGuard guard(argc, argv);
   Params pin;
-  std::string input;
+  std::string input, rstfile;
   for (int a = 1; a < argc; ++a) {
     if (std::strcmp(argv[a], "-i") == 0 && a + 1 < argc) { input = argv[++a]; continue; }
+    if (std::strcmp(argv[a], "-r") == 0 && a + 1 < argc) { rstfile = argv[++a]; continue; }
   }
-  if (input.empty()) { std::cerr << "usage: chasqui -i input.in [block.key=value ...]\n"; return 1; }
+  if (input.empty()) { std::cerr << "usage: chasqui -i input.in [-r restart.rst] [block.key=value ...]\n"; return 1; }
   pin.ReadFile(input);
   for (int a = 1; a < argc; ++a) {
-    if (std::strcmp(argv[a], "-i") == 0) { ++a; continue; }
+    if (std::strcmp(argv[a], "-i") == 0 || std::strcmp(argv[a], "-r") == 0) { ++a; continue; }
     if (std::strchr(argv[a], '=') != nullptr) pin.Override(argv[a]);
   }
 
   // ---------------- configuration ----------------
-  Config cfg;
+  Physics ph;
+  Config &cfg = ph.cfg;
   {
     const std::string r = pin.GetOrAddString("mhd", "reconstruct", "ppm");
     cfg.recon = (r == "dc") ? Recon::dc : (r == "plm") ? Recon::plm : (r == "ppm") ? Recon::ppm
@@ -83,6 +117,27 @@ int main(int argc, char *argv[]) {
     cfg.bc1 = ParseBC(pin.GetOrAddString("mesh", "bc_x1", "periodic"));
     cfg.bc2 = ParseBC(pin.GetOrAddString("mesh", "bc_x2", "periodic"));
     cfg.bc3 = ParseBC(pin.GetOrAddString("mesh", "bc_x3", "periodic"));
+    ph.fofc = pin.GetOrAddBool("mhd", "fofc", true);
+    // non-ideal terms
+    ph.diff.nu = pin.GetOrAddReal("diffusion", "nu", 0.0);
+    ph.diff.kappa = pin.GetOrAddReal("diffusion", "kappa", 0.0);
+    ph.diff.eta = pin.GetOrAddReal("diffusion", "eta", 0.0);
+    // gravity
+    ph.grav.uniform = pin.GetOrAddBool("gravity", "uniform", false);
+    ph.grav.g1 = pin.GetOrAddReal("gravity", "g1", 0.0);
+    ph.grav.g2 = pin.GetOrAddReal("gravity", "g2", 0.0);
+    ph.grav.g3 = pin.GetOrAddReal("gravity", "g3", 0.0);
+    ph.grav.point = pin.GetOrAddBool("gravity", "point_mass", false);
+    ph.grav.gm = pin.GetOrAddReal("gravity", "gm", 0.0);
+    ph.grav.x0 = pin.GetOrAddReal("gravity", "x0", 0.0);
+    ph.grav.y0 = pin.GetOrAddReal("gravity", "y0", 0.0);
+    ph.grav.z0 = pin.GetOrAddReal("gravity", "z0", 0.0);
+    ph.grav.rsoft = pin.GetOrAddReal("gravity", "rsoft", 0.0);
+    // cooling
+    ph.cool.enabled = pin.GetOrAddBool("cooling", "enabled", false);
+    ph.cool.lambda0 = pin.GetOrAddReal("cooling", "lambda0", 0.0);
+    ph.cool.alpha = pin.GetOrAddReal("cooling", "alpha", 1.0);
+    ph.cool.tfloor = pin.GetOrAddReal("cooling", "tfloor", 0.0);
   }
 
   Mesh m;
@@ -104,55 +159,69 @@ int main(int argc, char *argv[]) {
   const std::string basename = pin.GetOrAddString("output", "basename", problem);
   const Real dt_vtk = pin.GetOrAddReal("output", "vtk_dt", -1.0);
   const Real dt_hst = pin.GetOrAddReal("output", "hst_dt", -1.0);
+  const Real dt_rst = pin.GetOrAddReal("output", "rst_dt", -1.0);
   const bool compute_error = pin.GetOrAddBool("output", "compute_error", false);
 
   std::cout << "# Chasqui MHD\n";
   pin.Print(std::cout);
   std::cout << "# execution space: " << ExecSpace::name() << "\n";
 
-  // ---------------- initial conditions ----------------
-  pgen::Initialize(problem, pin, m, cfg);
+  // ---------------- initial conditions or restart ----------------
+  Real t = 0.0;
+  int cycle = 0;
+  if (rstfile.empty()) {
+    pgen::Initialize(problem, pin, m, cfg);
+  } else {
+    restart::Read(m, rstfile, t, cycle);
+    std::cout << "# restarted from " << rstfile << " at t = " << t << ", cycle = " << cycle << "\n";
+  }
   kernels::Boundaries(m, cfg, m.u0, m.b1f0, m.b2f0, m.b3f0);
   Real min_dt = kernels::ConsToPrim(m, cfg, m.u0, m.b1f0, m.b2f0, m.b3f0, true);
+  min_dt = fmin(min_dt, diffusion::TimeStep(m, cfg, ph.diff));
 
   // keep the initial state on the host for error measurements
-  // (create_mirror always allocates, so this is a true copy even on host-only builds)
   auto u_init = Kokkos::create_mirror(Kokkos::HostSpace(), m.u0);
   auto bcc_init = Kokkos::create_mirror(Kokkos::HostSpace(), m.bcc);
   Kokkos::deep_copy(u_init, m.u0);
   Kokkos::deep_copy(bcc_init, m.bcc);
 
-  // ---------------- outputs at t = 0 ----------------
-  int nvtk = 0, nhst = 0;
-  Real t = 0.0, next_vtk = 0.0, next_hst = 0.0;
+  // ---------------- outputs ----------------
+  int nvtk = 0, nrst = 0;
+  Real next_vtk = t, next_hst = t, next_rst = t + dt_rst;
   std::ofstream hst;
   if (dt_hst > 0) {
-    hst.open(basename + ".hst");
-    hst << "# time dt mass mom1 mom2 mom3 etot ekin emag eint divB_max divB_L1\n";
+    hst.open(basename + ".hst", rstfile.empty() ? std::ios::out : std::ios::app);
+    if (rstfile.empty()) hst << "# time dt mass mom1 mom2 mom3 etot ekin emag eint divB_max divB_L1\n";
   }
-  auto do_outputs = [&](Real dt, bool force) {
-    if (dt_vtk > 0 && (t >= next_vtk - 1e-12 * tlim || force)) {
+  auto do_outputs = [&](Real dt, bool force, bool final = false) {
+    const Real eps = 1e-10 * (tlim > 0 ? tlim : 1.0);
+    if (dt_vtk > 0 && (t >= next_vtk - eps || force)) {
       char fn[256]; std::snprintf(fn, sizeof(fn), "%s.%04d.vtk", basename.c_str(), nvtk++);
-      output::WriteVTK(m, fn, t, 0);
+      output::WriteVTK(m, fn, t, cycle);
       next_vtk += dt_vtk;
     }
-    if (dt_hst > 0 && (t >= next_hst - 1e-12 * tlim || force)) {
+    if (dt_hst > 0 && (t >= next_hst - eps || force)) {
       auto h = output::History(m, m.u0, m.b1f0, m.b2f0, m.b3f0);
       hst << std::setprecision(12) << t << " " << dt << " " << h.mass << " " << h.mom1 << " " << h.mom2 << " "
           << h.mom3 << " " << h.etot << " " << h.ekin << " " << h.emag << " " << h.eint << " " << h.divb_max
           << " " << h.divb_l1 << "\n";
       hst.flush();
-      next_hst += dt_hst; ++nhst;
+      next_hst += dt_hst;
+    }
+    if (dt_rst > 0 && (t >= next_rst - eps || final)) {
+      char fn[256]; std::snprintf(fn, sizeof(fn), "%s.%04d.rst", basename.c_str(), nrst++);
+      restart::Write(m, fn, t, cycle);
+      next_rst += dt_rst;
     }
   };
-  do_outputs(0.0, true);
+  if (rstfile.empty()) do_outputs(0.0, true);
 
   // ---------------- time loop ----------------
   const int nstage = static_cast<int>(cfg.integ);
-  int cycle = 0;
+  const int cycle0 = cycle;
   Kokkos::fence();
   auto t0 = std::chrono::steady_clock::now();
-  while (t < tlim && (nlim < 0 || cycle < nlim)) {
+  while (t < tlim && (nlim < 0 || cycle - cycle0 < nlim)) {
     Real dt = cfg.cfl * min_dt;
     if (t + dt > tlim) dt = tlim - t;
 
@@ -169,11 +238,17 @@ int main(int argc, char *argv[]) {
         else             { g0 = 1.0 / 3.0; g1 = 2.0 / 3.0; beta = 2.0 / 3.0; cur_u1 = true; out_u1 = false; }
       }
       const bool last = (s == nstage);
-      Stage(m, cfg, cur_u1, out_u1, g0, g1, beta * dt, last);
+      Stage(m, ph, cur_u1, out_u1, g0, g1, beta * dt);
       Arr4 uo = out_u1 ? m.u1 : m.u0;
       Arr3 b1o = out_u1 ? m.b1f1 : m.b1f0, b2o = out_u1 ? m.b2f1 : m.b2f0, b3o = out_u1 ? m.b3f1 : m.b3f0;
+      if (last && ph.cool.enabled) {
+        // operator-split cooling on the end-of-step state (primitives of the last stage input)
+        kernels::ConsToPrim(m, cfg, uo, b1o, b2o, b3o, false);
+        srcterms::ApplyCooling(m, cfg.eos, ph.cool, uo, dt);
+        kernels::Boundaries(m, cfg, uo, b1o, b2o, b3o);   // ghosts must see the cooled state
+      }
       const Real mdt = kernels::ConsToPrim(m, cfg, uo, b1o, b2o, b3o, last);
-      if (last) min_dt = mdt;
+      if (last) min_dt = fmin(mdt, diffusion::TimeStep(m, cfg, ph.diff));
     }
     t += dt;
     ++cycle;
@@ -184,11 +259,13 @@ int main(int argc, char *argv[]) {
   }
   Kokkos::fence();
   const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-  if (dt_vtk > 0 || dt_hst > 0) do_outputs(0.0, true);
+  if (dt_vtk > 0 || dt_hst > 0 || dt_rst > 0) do_outputs(0.0, true, true);
 
   const double zones = static_cast<double>(m.nx1) * m.nx2 * m.nx3;
-  std::cout << "# cycles = " << cycle << ", time = " << t << ", wall = " << wall << " s\n";
-  std::cout << "# zone-cycles/second = " << std::scientific << zones * cycle / wall << "\n";
+  const int ncyc = cycle - cycle0;
+  std::cout << "# cycles = " << ncyc << ", time = " << t << ", wall = " << wall << " s\n";
+  std::cout << "# zone-cycles/second = " << std::scientific << zones * ncyc / wall << "\n";
+  if (ph.fofc) std::cout << "# first-order flux corrections applied: " << ph.fofc_count << "\n";
 
   if (compute_error) {
     auto hu = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), m.u0);

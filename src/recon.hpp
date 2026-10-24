@@ -38,8 +38,9 @@ KOKKOS_INLINE_FUNCTION void PLM(const Real q[6], Real &ql, Real &qr) {
 
 // CW84 interface value between cells a (left) and b (right) using limited slopes:
 //   q_{a+1/2} = q_a + (q_b - q_a)/2 - (dq_b - dq_a)/6
+// (written in a mirror-symmetric form so that reflected data give bitwise-reflected values)
 KOKKOS_INLINE_FUNCTION Real PPMInterface(Real qa, Real qb, Real dqa, Real dqb) {
-  return qa + Real(0.5) * (qb - qa) - (dqb - dqa) / Real(6);
+  return Real(0.5) * (qa + qb) + (dqa - dqb) / Real(6);
 }
 
 // CW84 monotonization of the parabola in a cell with value q and interface values (qL,qR)
@@ -85,9 +86,10 @@ KOKKOS_INLINE_FUNCTION Real WENOZRight(Real fm2, Real fm1, Real f0, Real fp1, Re
   const Real eps = Real(1e-36);
 #endif
   const Real c13 = Real(13) / Real(12);
-  const Real b0 = c13 * SQR(fm2 - Real(2) * fm1 + f0) + Real(0.25) * SQR(fm2 - Real(4) * fm1 + Real(3) * f0);
-  const Real b1 = c13 * SQR(fm1 - Real(2) * f0 + fp1) + Real(0.25) * SQR(fm1 - fp1);
-  const Real b2 = c13 * SQR(f0 - Real(2) * fp1 + fp2) + Real(0.25) * SQR(Real(3) * f0 - Real(4) * fp1 + fp2);
+  // smoothness indicators in a mirror-symmetric arithmetic form
+  const Real b0 = c13 * SQR((fm2 + f0) - Real(2) * fm1) + Real(0.25) * SQR((Real(3) * f0 + fm2) - Real(4) * fm1);
+  const Real b1 = c13 * SQR((fm1 + fp1) - Real(2) * f0) + Real(0.25) * SQR(fm1 - fp1);
+  const Real b2 = c13 * SQR((fp2 + f0) - Real(2) * fp1) + Real(0.25) * SQR((Real(3) * f0 + fp2) - Real(4) * fp1);
   const Real tau = fabs(b0 - b2);
   Real a0 = Real(0.1) * (Real(1) + tau / (b0 + eps));
   Real a1 = Real(0.6) * (Real(1) + tau / (b1 + eps));
