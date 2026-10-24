@@ -12,7 +12,8 @@ using Real = double;
 #endif
 
 // Conserved variable indices
-enum : int { IDN = 0, IM1 = 1, IM2 = 2, IM3 = 3, IEN = 4, NVAR = 5 };
+// IENT: conserved rho*s with s = p / rho^gamma (dual-energy entropy variable)
+enum : int { IDN = 0, IM1 = 1, IM2 = 2, IM3 = 3, IEN = 4, IENT = 5, NVAR = 6 };
 // Primitive variable indices (same slots; velocity and pressure replace momentum/energy)
 enum : int { IVX = 1, IVY = 2, IVZ = 3, IPR = 4 };
 // Magnetic field components
@@ -40,4 +41,6 @@ struct EOS {
   Real gm1;
   Real dfloor;
   Real pfloor;
+  bool dual_energy = false;   // use the entropy variable where the total-energy pressure is unreliable
+  Real de_eta = Real(1e-3);   // threshold: e_int / E_total below which entropy pressure is used
 };

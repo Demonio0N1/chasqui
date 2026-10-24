@@ -28,7 +28,12 @@ inline int FlagBadCells(const Mesh &m, const Config &cfg, Arr4 u, Arr3 b1, Arr3 
       bool bad = (d <= eos.dfloor);
       if (!bad) {
         const Real ke = Real(0.5) * (SQR(u(IM1, k, j, i)) + SQR(u(IM2, k, j, i)) + SQR(u(IM3, k, j, i))) / d;
-        const Real p = eos.gm1 * (u(IEN, k, j, i) - ke - Real(0.5) * (bx * bx + by * by + bz * bz));
+        const Real eint = u(IEN, k, j, i) - ke - Real(0.5) * (bx * bx + by * by + bz * bz);
+        Real p = eos.gm1 * eint;
+        // with dual energy the total-energy pressure is not the one that will be used where
+        // the internal energy is a tiny fraction of the total: check the entropy pressure there
+        if (eos.dual_energy && eint < eos.de_eta * fabs(u(IEN, k, j, i)))
+          p = (u(IENT, k, j, i) / d) * pow(d, eos.gamma);
         bad = (p <= eos.pfloor);
       }
       flag(k, j, i) = bad ? 1 : 0;
@@ -77,6 +82,8 @@ void RepairFluxes(const Mesh &m, const Config &cfg, const diffusion::Coeffs &dc,
       HLLE(L, R, bn(k, j, i), eos, f);
       flx(IDN, k, j, i) = f[FD]; flx(IVU, k, j, i) = f[FMU]; flx(IVV, k, j, i) = f[FMV];
       flx(IVW, k, j, i) = f[FMW]; flx(IEN, k, j, i) = f[FEN];
+      flx(IENT, k, j, i) = (f[FD] > Real(0)) ? f[FD] * w(IENT, kL, jL, iL) : (f[FD] < Real(0)) ? f[FD] * w(IENT, k, j, i)
+                                             : Real(0.5) * (f[FD] * (w(IENT, kL, jL, iL) + w(IENT, k, j, i)));
       et2(k, j, i) = -f[FBY];
       et1(k, j, i) = f[FBZ];
       // diffusive fluxes exist only on the faces of active cells (same range as diffusion::Fluxes)

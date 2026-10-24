@@ -39,6 +39,17 @@ KOKKOS_INLINE_FUNCTION void PhysFlux(const State &s, Real bn, Real gm1, Real &e,
   f[FBZ] = s.bz * s.u - bn * s.w;
 }
 
+// Modified fast speed of Minoshima & Miyoshi (2021): the sound speed replaced by |v|,
+// c_u^2 = 1/2 [ (c_a^2 + |v|^2) + sqrt((c_a^2 + |v|^2)^2 - 4 |v|^2 c_ax^2) ]
+KOKKOS_INLINE_FUNCTION Real FlowSpeedU(const State &s, Real bn) {
+  const Real vsq = s.u * s.u + s.v * s.v + s.w * s.w;
+  const Real casq = (bn * bn + s.by * s.by + s.bz * s.bz) / s.d;
+  const Real caxsq = bn * bn / s.d;
+  const Real a = casq + vsq;
+  const Real disc = a * a - Real(4) * vsq * caxsq;
+  return sqrt(Real(0.5) * (a + sqrt(fmax(disc, Real(0)))));
+}
+
 // ---------------------------------------------------------------------------------------
 // HLLE (Einfeldt 1988) — robust fallback
 KOKKOS_INLINE_FUNCTION void HLLE(const State &L, const State &R, Real bn, const EOS &eos, Real f[NFLX]) {
@@ -64,14 +75,40 @@ KOKKOS_INLINE_FUNCTION void HLLE(const State &L, const State &R, Real bn, const 
 // mirror images, products are ordered identically on both sides, and the left/right code
 // paths are literal copies of each other (see Fleischmann, Adami & Adams 2019 for why this
 // matters: floating-point addition is commutative but not associative).
-KOKKOS_INLINE_FUNCTION void HLLD(const State &L, const State &R, Real bn, const EOS &eos, Real f[NFLX]) {
+// Flux of an intermediate (star) state evaluated directly from that state with the
+// intermediate total pressure pts: needed by LHLLD, whose modified pts no longer satisfies
+// the jump conditions, so F_L + S_L (U* - U_L) would not contain the modification.
+KOKKOS_INLINE_FUNCTION void StarFlux(Real d, Real sm, Real v, Real w, Real e, Real by, Real bz,
+                                     Real bn, Real pts, Real f[NFLX]) {
+  const Real vdotb = (sm * bn + v * by) + w * bz;
+  f[FD] = d * sm;
+  f[FMU] = (d * sm) * sm + (pts - bn * bn);
+  f[FMV] = (d * sm) * v - bn * by;
+  f[FMW] = (d * sm) * w - bn * bz;
+  f[FEN] = (e + pts) * sm - bn * vdotb;
+  f[FBY] = by * sm - bn * v;
+  f[FBZ] = bz * sm - bn * w;
+}
+
+// theta, phi: the shock-stability and low-dissipation factors of Minoshima & Miyoshi (2021)
+// (both 1 recovers the original HLLD); lhlld also switches to their signal speeds
+// S_L = min(0, min(u) - cf_max), S_R = max(0, max(u) + cf_max).
+KOKKOS_INLINE_FUNCTION void HLLD(const State &L, const State &R, Real bn, const EOS &eos, Real f[NFLX],
+                                 Real theta = Real(1), Real phi = Real(1), bool lhlld = false) {
   Real fl[NFLX], fr[NFLX], el, er, ptl, ptr;
   PhysFlux(L, bn, eos.gm1, el, ptl, fl);
   PhysFlux(R, bn, eos.gm1, er, ptr, fr);
 
   const Real cl = FastSpeed(L, bn, eos.gamma), cr = FastSpeed(R, bn, eos.gamma);
-  const Real sl = fmin(L.u - cl, R.u - cr);
-  const Real sr = fmax(L.u + cl, R.u + cr);
+  Real sl, sr;
+  if (lhlld) {
+    const Real cmax = fmax(cl, cr);
+    sl = fmin(Real(0), fmin(L.u, R.u) - cmax);
+    sr = fmax(Real(0), fmax(L.u, R.u) + cmax);
+  } else {
+    sl = fmin(L.u - cl, R.u - cr);
+    sr = fmax(L.u + cl, R.u + cr);
+  }
 
   if (sl >= Real(0)) { for (int n = 0; n < NFLX; ++n) f[n] = fl[n]; return; }
   if (sr <= Real(0)) { for (int n = 0; n < NFLX; ++n) f[n] = fr[n]; return; }
@@ -84,8 +121,8 @@ KOKKOS_INLINE_FUNCTION void HLLD(const State &L, const State &R, Real bn, const 
   const Real iden = Real(1) / (dsr - dsl);
 
   // contact speed and total pressure in the star regions (MK05 eqs. 38, 41)
-  const Real sm = ((dsr * R.u - dsl * L.u) + (ptl - ptr)) * iden;
-  const Real pts = ((dsr * ptl - dsl * ptr) + ((L.d * R.d) * (srmr * slml)) * (R.u - L.u)) * iden;
+  const Real sm = ((dsr * R.u - dsl * L.u) + theta * (ptl - ptr)) * iden;
+  const Real pts = ((dsr * ptl - dsl * ptr) + (phi * ((L.d * R.d) * (srmr * slml))) * (R.u - L.u)) * iden;
 
   // ---- left star state (MK05 eqs. 43-47) ----
   const Real slms = sl - sm;
@@ -144,9 +181,14 @@ KOKKOS_INLINE_FUNCTION void HLLD(const State &L, const State &R, Real bn, const 
   const Real ur[NFLX] = {R.d, R.d * R.u, R.d * R.v, R.d * R.w, er, R.by, R.bz};
 
   Real fls[NFLX], frs[NFLX];   // single-star fluxes
-  for (int n = 0; n < NFLX; ++n) {
-    fls[n] = fl[n] + sl * (uls[n] - ul[n]);
-    frs[n] = fr[n] + sr * (urs[n] - ur[n]);
+  if (lhlld) {
+    StarFlux(dls, sm, vls, wls, els, byls, bzls, bn, pts, fls);
+    StarFlux(drs, sm, vrs, wrs, ers, byrs, bzrs, bn, pts, frs);
+  } else {
+    for (int n = 0; n < NFLX; ++n) {
+      fls[n] = fl[n] + sl * (uls[n] - ul[n]);
+      frs[n] = fr[n] + sr * (urs[n] - ur[n]);
+    }
   }
   // strict inequalities: when S*_L = S*_R = 0 (bn = 0 and S_M = 0) both sides are averaged
   // below instead of picking one, which keeps a mirror-symmetric pair exactly symmetric
@@ -176,12 +218,17 @@ KOKKOS_INLINE_FUNCTION void HLLD(const State &L, const State &R, Real bn, const 
   const Real ulss[NFLX] = {dls, dls * sm, dls * vss, dls * wss, elss, byss, bzss};
   const Real urss[NFLX] = {drs, drs * sm, drs * vss, drs * wss, erss, byss, bzss};
 
-  if (sm > Real(0)) {
-    for (int n = 0; n < NFLX; ++n) f[n] = fls[n] + sls * (ulss[n] - uls[n]);
-  } else if (sm < Real(0)) {
-    for (int n = 0; n < NFLX; ++n) f[n] = frs[n] + srs * (urss[n] - urs[n]);
+  Real flss[NFLX], frss[NFLX];   // double-star fluxes
+  if (lhlld) {
+    StarFlux(dls, sm, vss, wss, elss, byss, bzss, bn, pts, flss);
+    StarFlux(drs, sm, vss, wss, erss, byss, bzss, bn, pts, frss);
   } else {
-    for (int n = 0; n < NFLX; ++n)
-      f[n] = Real(0.5) * ((fls[n] + sls * (ulss[n] - uls[n])) + (frs[n] + srs * (urss[n] - urs[n])));
+    for (int n = 0; n < NFLX; ++n) {
+      flss[n] = fls[n] + sls * (ulss[n] - uls[n]);
+      frss[n] = frs[n] + srs * (urss[n] - urs[n]);
+    }
   }
+  if (sm > Real(0))      { for (int n = 0; n < NFLX; ++n) f[n] = flss[n]; }
+  else if (sm < Real(0)) { for (int n = 0; n < NFLX; ++n) f[n] = frss[n]; }
+  else                   { for (int n = 0; n < NFLX; ++n) f[n] = Real(0.5) * (flss[n] + frss[n]); }
 }

@@ -14,11 +14,17 @@ en un código limitado por ancho de banda de memoria.
 | Componente | Opciones | Por defecto |
 |---|---|---|
 | Reconstrucción | `dc`, `plm` (van Leer), `ppm` (Colella-Woodward 1984), `ppmx` (PPM extremo-preservante, Colella & Sekora 2008 / McCorquodale & Colella 2011), `wenoz` (Borges 2008) | `ppm` |
-| Solver de Riemann | `hlld` (Miyoshi & Kusano 2005, 7 ondas), `hlle` | `hlld` |
+| Solver de Riemann | `hlld` (Miyoshi & Kusano 2005, 7 ondas), `lhlld` (Minoshima & Miyoshi 2021: baja disipación a bajo Mach y estable frente al carbunclo), `hlle` | `hlld` |
+| Variables de reconstrucción | primitivas o características (`characteristic = true`, eigen-sistema de Roe & Balsara 1996 verificado numéricamente en `tests/eigen_test.cpp`) | primitivas |
+| Energía | total, o doble energía (`dual_energy = true`: entropía advectada, interruptor de Bryan et al. 2014 con umbral `de_eta`) | total |
+| Positividad | `fofc` (corrección de flujo de primer orden a posteriori) y/o `flux_limiter` (Hu, Adams & Shu 2013, válido para cfl ≤ 1/(2 ndim)) | `fofc` |
+| Términos difusivos | explícitos o super-time-stepping RKL2 (`[diffusion] sts = true`, Meyer, Balsara & Aslam 2014) | explícitos |
 | Integración temporal | `rk1`, `rk2`, `rk3` (SSP), `rk4` = SSPRK(4,3) de Spiteri & Ruuth 2002 (3.º orden, estable hasta CFL 2× mayor, 4 etapas) | `rk3` |
 | Aplanado de choques | `flatten` (Colella & Woodward 1984) para ppm/ppmx/wenoz | `true` |
 | Bajo Mach | `low_mach` (Thornber et al. 2008): velocidades de cara mezcladas con z = min(1, M) | `false` |
 | ∇·B | Transporte restringido, EMF de esquina con promedio *upwind* (Gardiner & Stone 2005) | — |
+
+Preset recomendado para choques MHD: `inputs/recommended_mhd.in`.
 | Precisión | `double` (defecto) o `float` (`-D CHASQUI_SINGLE_PRECISION=ON`) | `double` |
 
 Unidades: presión magnética = B²/2 (μ₀ = 1), las mismas que Athena y PLUTO.
@@ -94,9 +100,29 @@ cara→centro de B y la EMF de esquina son de 2.º orden, como en Athena++). 3D:
 ∇·B ≤ 5e-13 y energía total constante a 1e-12 en todas las corridas (CPAW 3D, Orszag-Tang,
 Brio-Wu, blast MHD 3D).
 
-Vórtice de Gresho a bajo Mach (64², PPMX + HLLD, t = 1): energía cinética retenida
-99.08 % a M = 0.01 sin corrección y 99.89 % con `low_mach = true` (igual que a M = 0.1), es
-decir, la disipación deja de crecer al bajar el Mach.
+Vórtice de Gresho a bajo Mach (64², PPMX, t = 1), energía cinética retenida:
+
+| | M = 0.1 | M = 0.01 |
+|---|---|---|
+| HLLD | 99.75 % | 99.08 % |
+| HLLD + `low_mach` (Thornber) | 99.89 % | 99.89 % |
+| LHLLD | 99.88 % | 99.87 % |
+
+Choque de Mach 6 alineado con la malla sobre un medio con ruido de 10⁻³ (prueba de Quirk,
+2D): variación transversal de densidad tras el choque, HLLD 0.245 (inestabilidad de
+carbunclo), LHLLD 0.0024 (nivel de la semilla).
+
+Brio-Wu (400 celdas, HLLD + RK3): desviación típica de B_y en la meseta post-choque, PLM
+2.0e-3 → 3.5e-4, PPMX 8.8e-3 → 1.1e-3, WENO-Z 8.4e-3 → 1.3e-3 al pasar de variables primitivas
+a características.
+
+Flujo frío hipersónico (ρ = 1, v = 10⁴, p = 10⁻⁸, e_int/E = 3·10⁻¹²): error relativo de la
+presión tras 100 pasos 6.6·10⁻³ con energía total, 6·10⁻⁹ con doble energía. Blast de β = 2·10⁻⁵:
+sin doble energía la presión cae al piso (10⁻¹²) en todo el dominio; con ella se mantiene en su
+valor físico (10⁻⁴) sin ninguna corrección de positividad.
+
+Difusión rígida (η = 0.5, dt_par = 2.4·10⁻⁴): explícito 683 pasos, RKL2 14 pasos con 111 etapas
+en total, misma exactitud (error 10⁻³ frente a la solución exacta), 13× menos tiempo.
 
 ## Física
 
@@ -127,6 +153,13 @@ Limitaciones conocidas:
   el valor por defecto; `-D CHASQUI_ALLOW_FMA=ON` la reactiva a cambio de perder la simetría
   exacta). En GPU, `nvcc` contrae FMA por defecto: usar `-fmad=false` si se quiere la
   simetría exacta allí.
+- `characteristic = true` no es *bitwise* simétrico (la proyección sobre autovectores no está
+  escrita en forma especular); el resto de opciones sí lo son.
+- `flux_limiter` garantiza positividad solo para cfl ≤ 1/(2·ndim) (hipótesis de Hu, Adams & Shu);
+  fuera de ese rango no protege, y `fofc` (a posteriori, sin condición de CFL) sigue siendo la red
+  recomendada. En la doble rarefacción u = ∓6 a cfl 0.8, `fofc` rescata la corrida con 46
+  correcciones y el limitador no.
+- Costo en CPU: características + LHLLD + doble energía ≈ 2.2× el tiempo de PPMX + HLLD.
 - Sin MPI, sin AMR, sin geometrías curvilíneas, sin EOS no ideales todavía.
 
 ## Problemas incluidos
@@ -141,13 +174,8 @@ desde un potencial vector, que garantiza ∇·B = 0 a nivel de redondeo).
 - [ ] Medir en GPU (RTX 4090) contra AthenaK en el mismo problema.
 - [ ] MPI (descomposición de dominio) y salida HDF5.
 - [ ] EOS isoterma y general; conducción anisótropa (a lo largo de B).
-- [ ] Reconstrucción en variables características (reduce las oscilaciones post-choque de
-      PPMX/WENO-Z en Brio-Wu, que el aplanado solo recorta ~15 %).
-- [ ] HLLD de baja disipación de Minoshima & Miyoshi (2021): quita la inestabilidad de choque
-      multidimensional y mejora los flujos casi incompresibles sin recurrir al parche de Thornber.
-- [ ] Formalismo de doble energía / interruptor de entropía para regiones de β muy bajo.
-- [ ] Super-time-stepping RKL2 (Meyer, Balsara & Aslam 2014) para los términos difusivos.
-- [ ] Limitador de positividad de Hu, Adams & Shu (2013) como alternativa al FOFC.
+- [ ] Proyección característica en aritmética especular exacta.
+- [ ] Conducción anisótropa a lo largo de B (Sharma & Hammett 2007).
 - [ ] Fronteras definidas por el usuario; términos fuente de usuario; escalares pasivos.
 - [ ] Vectorización del bucle interno en CPU.
 

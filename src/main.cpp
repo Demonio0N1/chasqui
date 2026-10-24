@@ -17,6 +17,8 @@
 #include "pgen.hpp"
 #include "output.hpp"
 #include "restart.hpp"
+#include "sts.hpp"
+#include "positivity.hpp"
 
 namespace {
 
@@ -33,7 +35,10 @@ struct Physics {
   srcterms::Gravity grav;
   srcterms::Cooling cool;
   bool fofc = false;
-  long fofc_count = 0;
+  bool flux_limiter = false;   // Hu-Adams-Shu positivity flux limiter
+  bool sts = false;            // RKL2 super-time-stepping for the diffusive terms
+  sts::Work sts_work;
+  long fofc_count = 0, limiter_count = 0, sts_stages = 0;
 };
 
 // One Runge-Kutta stage: out = g0*u0 + g1*u1 - beta_dt * L(cur), where `cur` is the state
@@ -47,11 +52,18 @@ void Stage(Mesh &m, Physics &ph, bool cur_is_u1, bool out_is_u1, Real g0, Real g
   kernels::FluxesDispatch<0>(m, cfg, b1c);
   if (m.two_d) kernels::FluxesDispatch<1>(m, cfg, b2c);
   if (m.three_d) kernels::FluxesDispatch<2>(m, cfg, b3c);
-  diffusion::Fluxes<0>(m, ph.diff, b1c, b2c, b3c);
-  if (m.two_d) diffusion::Fluxes<1>(m, ph.diff, b1c, b2c, b3c);
-  if (m.three_d) diffusion::Fluxes<2>(m, ph.diff, b1c, b2c, b3c);
+  if (!ph.sts) {
+    diffusion::Fluxes<0>(m, ph.diff, b1c, b2c, b3c);
+    if (m.two_d) diffusion::Fluxes<1>(m, ph.diff, b1c, b2c, b3c);
+    if (m.three_d) diffusion::Fluxes<2>(m, ph.diff, b1c, b2c, b3c);
+  }
+  if (ph.flux_limiter) {
+    positivity::LimitFluxes<0>(m, cfg, beta_dt, b1c, &ph.limiter_count);
+    if (m.two_d) positivity::LimitFluxes<1>(m, cfg, beta_dt, b2c, &ph.limiter_count);
+    if (m.three_d) positivity::LimitFluxes<2>(m, cfg, beta_dt, b3c, &ph.limiter_count);
+  }
   kernels::CornerEMF(m);
-  diffusion::ResistiveEMF(m, ph.diff, b1c, b2c, b3c);
+  if (!ph.sts) diffusion::ResistiveEMF(m, ph.diff, b1c, b2c, b3c);
 
   kernels::StageArrays s;
   s.ua = m.u0; s.ub = m.u1; s.uout = out_is_u1 ? m.u1 : m.u0;
@@ -67,11 +79,12 @@ void Stage(Mesh &m, Physics &ph, bool cur_is_u1, bool out_is_u1, Real g0, Real g
     const int nbad = fofc::FlagBadCells(m, cfg, s.uout, s.b1out, s.b2out, s.b3out);
     if (nbad > 0) {
       ph.fofc_count += nbad;
-      fofc::RepairFluxes<0>(m, cfg, ph.diff, b1c, b2c, b3c);
-      if (m.two_d) fofc::RepairFluxes<1>(m, cfg, ph.diff, b1c, b2c, b3c);
-      if (m.three_d) fofc::RepairFluxes<2>(m, cfg, ph.diff, b1c, b2c, b3c);
+      const diffusion::Coeffs dcr = ph.sts ? diffusion::Coeffs{} : ph.diff;
+      fofc::RepairFluxes<0>(m, cfg, dcr, b1c, b2c, b3c);
+      if (m.two_d) fofc::RepairFluxes<1>(m, cfg, dcr, b1c, b2c, b3c);
+      if (m.three_d) fofc::RepairFluxes<2>(m, cfg, dcr, b1c, b2c, b3c);
       kernels::CornerEMF(m);
-      diffusion::ResistiveEMF(m, ph.diff, b1c, b2c, b3c);
+      if (!ph.sts) diffusion::ResistiveEMF(m, ph.diff, b1c, b2c, b3c);
       kernels::Update(m, s, g0, g1, beta_dt);
       srcterms::ApplyGravity(m, ph.grav, s.uout, beta_dt);
     }
@@ -105,8 +118,12 @@ int main(int argc, char *argv[]) {
               : (r == "ppmx") ? Recon::ppmx : (r == "wenoz") ? Recon::wenoz
               : throw std::runtime_error("unknown reconstruct: " + r);
     const std::string s = pin.GetOrAddString("mhd", "rsolver", "hlld");
-    cfg.rsolver = (s == "hlld") ? RSolver::hlld : (s == "hlle") ? RSolver::hlle
+    cfg.rsolver = (s == "hlld") ? RSolver::hlld : (s == "lhlld") ? RSolver::lhlld : (s == "hlle") ? RSolver::hlle
                 : throw std::runtime_error("unknown rsolver: " + s);
+    cfg.characteristic = pin.GetOrAddBool("mhd", "characteristic", false);
+    cfg.lhlld_phi = pin.GetOrAddReal("mhd", "lhlld_phi", -1.0);
+    cfg.eos.dual_energy = pin.GetOrAddBool("mhd", "dual_energy", false);
+    cfg.eos.de_eta = pin.GetOrAddReal("mhd", "de_eta", 1.0e-3);
     const std::string t = pin.GetOrAddString("time", "integrator", "rk3");
     cfg.integ = (t == "rk1") ? Integrator::rk1 : (t == "rk2") ? Integrator::rk2 : (t == "rk3") ? Integrator::rk3
               : (t == "rk4" || t == "ssprk43") ? Integrator::rk4 : throw std::runtime_error("unknown integrator: " + t);
@@ -121,6 +138,8 @@ int main(int argc, char *argv[]) {
     cfg.bc2 = ParseBC(pin.GetOrAddString("mesh", "bc_x2", "periodic"));
     cfg.bc3 = ParseBC(pin.GetOrAddString("mesh", "bc_x3", "periodic"));
     ph.fofc = pin.GetOrAddBool("mhd", "fofc", true);
+    ph.flux_limiter = pin.GetOrAddBool("mhd", "flux_limiter", false);
+    ph.sts = pin.GetOrAddBool("diffusion", "sts", false);
     // non-ideal terms
     ph.diff.nu = pin.GetOrAddReal("diffusion", "nu", 0.0);
     ph.diff.kappa = pin.GetOrAddReal("diffusion", "kappa", 0.0);
@@ -180,7 +199,7 @@ int main(int argc, char *argv[]) {
   }
   kernels::Boundaries(m, cfg, m.u0, m.b1f0, m.b2f0, m.b3f0);
   Real min_dt = kernels::ConsToPrim(m, cfg, m.u0, m.b1f0, m.b2f0, m.b3f0, true);
-  min_dt = fmin(min_dt, diffusion::TimeStep(m, cfg, ph.diff));
+  if (!ph.sts) min_dt = fmin(min_dt, diffusion::TimeStep(m, cfg, ph.diff));
 
   // keep the initial state on the host for error measurements
   auto u_init = Kokkos::create_mirror(Kokkos::HostSpace(), m.u0);
@@ -251,14 +270,23 @@ int main(int argc, char *argv[]) {
       Stage(m, ph, cur_u1, out_u1, g0, g1, beta * dt);
       Arr4 uo = out_u1 ? m.u1 : m.u0;
       Arr3 b1o = out_u1 ? m.b1f1 : m.b1f0, b2o = out_u1 ? m.b2f1 : m.b2f0, b3o = out_u1 ? m.b3f1 : m.b3f0;
-      if (last && ph.cool.enabled) {
-        // operator-split cooling on the end-of-step state (primitives of the last stage input)
-        kernels::ConsToPrim(m, cfg, uo, b1o, b2o, b3o, false);
-        srcterms::ApplyCooling(m, cfg.eos, ph.cool, uo, dt);
-        kernels::Boundaries(m, cfg, uo, b1o, b2o, b3o);   // ghosts must see the cooled state
-      }
-      const Real mdt = kernels::ConsToPrim(m, cfg, uo, b1o, b2o, b3o, last);
-      if (last) min_dt = fmin(mdt, diffusion::TimeStep(m, cfg, ph.diff));
+      const bool split_ops = last && (ph.sts || ph.cool.enabled);
+      const Real mdt = kernels::ConsToPrim(m, cfg, uo, b1o, b2o, b3o, last && !split_ops);
+      if (last && !split_ops) min_dt = fmin(mdt, diffusion::TimeStep(m, cfg, ph.diff));
+    }
+    // operator-split pieces on the end-of-step state (in u0 / b?f0)
+    if (ph.sts) {
+      ph.sts_stages += sts::Advance(m, cfg, ph.diff, ph.sts_work, dt, diffusion::TimeStep(m, cfg, ph.diff));
+      kernels::Boundaries(m, cfg, m.u0, m.b1f0, m.b2f0, m.b3f0);
+    }
+    if (ph.cool.enabled) {
+      kernels::ConsToPrim(m, cfg, m.u0, m.b1f0, m.b2f0, m.b3f0, false);
+      srcterms::ApplyCooling(m, cfg.eos, ph.cool, m.u0, dt);
+      kernels::Boundaries(m, cfg, m.u0, m.b1f0, m.b2f0, m.b3f0);   // ghosts must see the cooled state
+    }
+    if (ph.sts || ph.cool.enabled) {
+      min_dt = kernels::ConsToPrim(m, cfg, m.u0, m.b1f0, m.b2f0, m.b3f0, true);
+      if (!ph.sts) min_dt = fmin(min_dt, diffusion::TimeStep(m, cfg, ph.diff));
     }
     t += dt;
     ++cycle;
@@ -276,18 +304,20 @@ int main(int argc, char *argv[]) {
   std::cout << "# cycles = " << ncyc << ", time = " << t << ", wall = " << wall << " s\n";
   std::cout << "# zone-cycles/second = " << std::scientific << zones * ncyc / wall << "\n";
   if (ph.fofc) std::cout << "# first-order flux corrections applied: " << ph.fofc_count << "\n";
+  if (ph.flux_limiter) std::cout << "# positivity flux limiter activations: " << ph.limiter_count << "\n";
+  if (ph.sts) std::cout << "# super-time-stepping stages (total): " << ph.sts_stages << "\n";
 
   if (compute_error) {
     auto hu = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), m.u0);
     auto hb = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), m.bcc);
-    double err[NVAR + 3] = {0, 0, 0, 0, 0, 0, 0, 0}, tot = 0;
+    double err[NVAR + 3] = {0}, tot = 0;
     for (int k = m.ks; k <= m.ke; ++k)
       for (int j = m.js; j <= m.je; ++j)
         for (int i = m.is; i <= m.ie; ++i) {
           for (int n = 0; n < NVAR; ++n) err[n] += std::fabs(hu(n, k, j, i) - u_init(n, k, j, i));
           for (int n = 0; n < 3; ++n) err[NVAR + n] += std::fabs(hb(n, k, j, i) - bcc_init(n, k, j, i));
         }
-    std::cout << "# L1 errors vs initial state (rho m1 m2 m3 E B1 B2 B3 | total):\n# ";
+    std::cout << "# L1 errors vs initial state (rho m1 m2 m3 E rho*s B1 B2 B3 | total):\n# ";
     for (int n = 0; n < NVAR + 3; ++n) { err[n] /= zones; tot += err[n]; std::cout << err[n] << " "; }
     std::cout << "| " << tot << "\n";
     std::ofstream ef(basename + "_errors.dat", std::ios::app);

@@ -8,6 +8,7 @@
 #include <string>
 #include <cmath>
 #include <stdexcept>
+#include <random>
 #include "defs.hpp"
 #include "mesh.hpp"
 #include "params.hpp"
@@ -160,6 +161,10 @@ inline void ShockTube(Params &pin, const Mesh &m, HostFields &h) {
   const Real byl = pin.GetOrAddReal("problem", "byl", 1.0), byr = pin.GetOrAddReal("problem", "byr", -1.0);
   const Real bx = pin.GetOrAddReal("problem", "bx", 0.75);
   const Real x0 = pin.GetOrAddReal("problem", "x0", 0.0);
+  const Real ul = pin.GetOrAddReal("problem", "ul", 0.0), ur = pin.GetOrAddReal("problem", "ur", 0.0);
+  const Real perturb = pin.GetOrAddReal("problem", "perturb", 0.0);   // random density perturbation
+  std::mt19937 rng(42);
+  std::uniform_real_distribution<double> U(-1.0, 1.0);
   for (int k = 0; k < m.nk + 1; ++k)
     for (int j = 0; j < m.nj + 1; ++j)
       for (int i = 0; i < m.ni + 1; ++i) {
@@ -171,8 +176,9 @@ inline void ShockTube(Params &pin, const Mesh &m, HostFields &h) {
     for (int j = 0; j < m.nj; ++j)
       for (int i = 0; i < m.ni; ++i) {
         const bool left = (m.x1v(i) < x0);
-        h.w(IDN, k, j, i) = left ? dl : dr;
-        h.w(IVX, k, j, i) = h.w(IVY, k, j, i) = h.w(IVZ, k, j, i) = 0.0;
+        h.w(IDN, k, j, i) = (left ? dl : dr) * (1.0 + perturb * U(rng));
+        h.w(IVX, k, j, i) = left ? ul : ur;
+        h.w(IVY, k, j, i) = h.w(IVZ, k, j, i) = 0.0;
         h.w(IPR, k, j, i) = left ? pl : pr;
       }
 }
@@ -290,6 +296,8 @@ inline void Initialize(const std::string &name, Params &pin, Mesh &m, const Conf
         hu(IM1, k, j, i) = d * vx; hu(IM2, k, j, i) = d * vy; hu(IM3, k, j, i) = d * vz;
         hu(IEN, k, j, i) = h.w(IPR, k, j, i) / cfg.eos.gm1 + 0.5 * d * (vx * vx + vy * vy + vz * vz)
                            + 0.5 * (bx * bx + by * by + bz * bz);
+        h.w(IENT, k, j, i) = h.w(IPR, k, j, i) / pow(d, cfg.eos.gamma);   // s = p / rho^gamma
+        hu(IENT, k, j, i) = d * h.w(IENT, k, j, i);
       }
   Kokkos::deep_copy(m.u0, hu);
   Kokkos::deep_copy(m.b1f0, h.b1);

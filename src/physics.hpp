@@ -15,8 +15,9 @@
 #include "mesh.hpp"
 #include "recon.hpp"
 #include "riemann.hpp"
+#include "eigen_mhd.hpp"
 
-enum class RSolver : int { hlle = 0, hlld = 1 };
+enum class RSolver : int { hlle = 0, hlld = 1, lhlld = 2 };
 
 struct Config {
   Recon recon = Recon::ppm;
@@ -26,6 +27,8 @@ struct Config {
   Real cfl = Real(0.3);
   bool low_mach = false;   // Thornber et al. (2008) low-Mach correction of the face velocities
   bool flatten = true;     // Colella-Woodward shock flattening for ppm/ppmx/wenoz
+  bool characteristic = false;   // reconstruct in characteristic variables
+  Real lhlld_phi = Real(-1);     // debug: force the LHLLD low-Mach factor (-1 = computed)
   BCType bc1 = BCType::periodic, bc2 = BCType::periodic, bc3 = BCType::periodic;
 };
 
@@ -56,15 +59,26 @@ KOKKOS_INLINE_FUNCTION void LoadStencil(const Arr4 &a, int n, int k, int j, int 
 // -----------------------------------------------------------------------------------------
 // Fused reconstruction + Riemann solve for one direction.
 //   DIR = 0,1,2  (x1,x2,x3).  In the rotated frame: u = v_DIR, v = v_{DIR+1}, w = v_{DIR+2}.
+// Options: reconstruction in characteristic variables (local eigen-decomposition of the
+// primitive MHD system at each side's cell), Colella-Woodward flattening, Thornber low-Mach
+// blending, and the LHLLD factors of Minoshima & Miyoshi (2021).
 template <int DIR, Recon R, RSolver S>
 void Fluxes(const Mesh &m, const Config &cfg, Arr3 bn) {
   const Geom g(m);
   const EOS eos = cfg.eos;
   const bool low_mach = cfg.low_mach;
   const bool flatten = cfg.flatten && (R != Recon::dc && R != Recon::plm);
+  const bool charac = cfg.characteristic && (R != Recon::dc);
+  const Real force_phi = cfg.lhlld_phi;
   constexpr int di = (DIR == 0) ? 1 : 0, dj = (DIR == 1) ? 1 : 0, dk = (DIR == 2) ? 1 : 0;
   constexpr int IVU = IVX + DIR, IVV = IVX + (DIR + 1) % 3, IVW = IVX + (DIR + 2) % 3;
   constexpr int IBT1 = (DIR + 1) % 3, IBT2 = (DIR + 2) % 3;
+  // unit offsets of the transverse directions (for the LHLLD shock detector)
+  constexpr int t1 = (DIR + 1) % 3, t2 = (DIR + 2) % 3;
+  constexpr int di1 = (t1 == 0), dj1 = (t1 == 1), dk1 = (t1 == 2);
+  constexpr int di2 = (t2 == 0), dj2 = (t2 == 1), dk2 = (t2 == 2);
+  const bool has_t1 = (t1 == 0) || (t1 == 1 && m.two_d) || (t1 == 2 && m.three_d);
+  const bool has_t2 = (t2 == 0) || (t2 == 1 && m.two_d) || (t2 == 2 && m.three_d);
 
   // face ranges: normal index over faces of active cells, transverse ranges extended by
   // one cell on each side (needed by the corner-EMF stencil)
@@ -81,47 +95,77 @@ void Fluxes(const Mesh &m, const Config &cfg, Arr3 bn) {
 
   Kokkos::parallel_for("fluxes", Range3({kl, jl, il}, {ku + 1, ju + 1, iu + 1}),
     KOKKOS_LAMBDA(const int k, const int j, const int i) {
-      Real q[6], ql, qr;
-      State L, Rr;
-      // primitives
-      LoadStencil<R>(w, IDN, k, j, i, dk, dj, di, q); recon::Face<R>(q, ql, qr);
-      L.d = ql; Rr.d = qr;
-      const Real dl_dc = q[2], dr_dc = q[3];
-      LoadStencil<R>(w, IVU, k, j, i, dk, dj, di, q); recon::Face<R>(q, ql, qr);
-      L.u = ql; Rr.u = qr; const Real ul_dc = q[2], ur_dc = q[3];
-      Real qu[6]; for (int s = 0; s < 6; ++s) qu[s] = q[s];
-      LoadStencil<R>(w, IVV, k, j, i, dk, dj, di, q); recon::Face<R>(q, ql, qr);
-      L.v = ql; Rr.v = qr; const Real vl_dc = q[2], vr_dc = q[3];
-      LoadStencil<R>(w, IVW, k, j, i, dk, dj, di, q); recon::Face<R>(q, ql, qr);
-      L.w = ql; Rr.w = qr; const Real wl_dc = q[2], wr_dc = q[3];
-      LoadStencil<R>(w, IPR, k, j, i, dk, dj, di, q); recon::Face<R>(q, ql, qr);
-      L.p = ql; Rr.p = qr; const Real pl_dc = q[2], pr_dc = q[3];
-      Real qp[6]; for (int s = 0; s < 6; ++s) qp[s] = q[s];
-      // transverse magnetic fields (cell-centered)
-      LoadStencil<R>(bcc, IBT1, k, j, i, dk, dj, di, q); recon::Face<R>(q, ql, qr);
-      L.by = ql; Rr.by = qr; const Real byl_dc = q[2], byr_dc = q[3];
-      LoadStencil<R>(bcc, IBT2, k, j, i, dk, dj, di, q); recon::Face<R>(q, ql, qr);
-      L.bz = ql; Rr.bz = qr; const Real bzl_dc = q[2], bzr_dc = q[3];
+      // stencils of the 7 primitive variables in the rotated frame: d, u, v, w, p, by, bz
+      Real qs[7][6];
+      LoadStencil<R>(w, IDN, k, j, i, dk, dj, di, qs[0]);
+      LoadStencil<R>(w, IVU, k, j, i, dk, dj, di, qs[1]);
+      LoadStencil<R>(w, IVV, k, j, i, dk, dj, di, qs[2]);
+      LoadStencil<R>(w, IVW, k, j, i, dk, dj, di, qs[3]);
+      LoadStencil<R>(w, IPR, k, j, i, dk, dj, di, qs[4]);
+      LoadStencil<R>(bcc, IBT1, k, j, i, dk, dj, di, qs[5]);
+      LoadStencil<R>(bcc, IBT2, k, j, i, dk, dj, di, qs[6]);
+      Real wl[7], wr[7];
+      if (!charac) {
+        for (int n = 0; n < 7; ++n) recon::Face<R>(qs[n], wl[n], wr[n]);
+      } else {
+        // local characteristic decomposition at the cell on each side of the face
+        Real Lm[eigen_mhd::NW][eigen_mhd::NW], Rm[eigen_mhd::NW][eigen_mhd::NW];
+        Real c[6], cl, cr;
+        // left side: cell i-1 (stencil index 2), normal field of that cell
+        eigen_mhd::Eigensystem(qs[0][2], qs[1][2], qs[2][2], qs[3][2], qs[4][2], qs[5][2], qs[6][2],
+                               bcc(DIR, k - dk, j - dj, i - di), eos.gamma, Lm, Rm);
+        Real chl[7];
+        for (int kk = 0; kk < 7; ++kk) {
+          for (int st = 0; st < 6; ++st) {
+            Real acc = Real(0);
+            for (int n = 0; n < 7; ++n) acc += Lm[kk][n] * qs[n][st];
+            c[st] = acc;
+          }
+          recon::Face<R>(c, cl, cr);
+          chl[kk] = cl;
+        }
+        for (int n = 0; n < 7; ++n) {
+          Real acc = Real(0);
+          for (int kk = 0; kk < 7; ++kk) acc += Rm[n][kk] * chl[kk];
+          wl[n] = acc;
+        }
+        // right side: cell i (stencil index 3)
+        eigen_mhd::Eigensystem(qs[0][3], qs[1][3], qs[2][3], qs[3][3], qs[4][3], qs[5][3], qs[6][3],
+                               bcc(DIR, k, j, i), eos.gamma, Lm, Rm);
+        Real chr[7];
+        for (int kk = 0; kk < 7; ++kk) {
+          for (int st = 0; st < 6; ++st) {
+            Real acc = Real(0);
+            for (int n = 0; n < 7; ++n) acc += Lm[kk][n] * qs[n][st];
+            c[st] = acc;
+          }
+          recon::Face<R>(c, cl, cr);
+          chr[kk] = cr;
+        }
+        for (int n = 0; n < 7; ++n) {
+          Real acc = Real(0);
+          for (int kk = 0; kk < 7; ++kk) acc += Rm[n][kk] * chr[kk];
+          wr[n] = acc;
+        }
+      }
+      // entropy variable (dual energy): reconstructed as a scalar
+      Real q[6], sl, sr;
+      LoadStencil<R>(w, IENT, k, j, i, dk, dj, di, q); recon::Face<R>(q, sl, sr);
+      const Real sl_dc = q[2], sr_dc = q[3];
+
       if (flatten) {
         // flattening coefficients of cell i-1 (stencil i-3..i+1) and cell i (i-2..i+2)
-        const Real fL = recon::Flattening(&qp[0], qu[1], qu[3]);
-        const Real fR = recon::Flattening(&qp[1], qu[2], qu[4]);
-        if (fL > Real(0)) {
-          L.d += fL * (dl_dc - L.d); L.u += fL * (ul_dc - L.u); L.v += fL * (vl_dc - L.v); L.w += fL * (wl_dc - L.w);
-          L.p += fL * (pl_dc - L.p); L.by += fL * (byl_dc - L.by); L.bz += fL * (bzl_dc - L.bz);
-        }
-        if (fR > Real(0)) {
-          Rr.d += fR * (dr_dc - Rr.d); Rr.u += fR * (ur_dc - Rr.u); Rr.v += fR * (vr_dc - Rr.v); Rr.w += fR * (wr_dc - Rr.w);
-          Rr.p += fR * (pr_dc - Rr.p); Rr.by += fR * (byr_dc - Rr.by); Rr.bz += fR * (bzr_dc - Rr.bz);
-        }
+        const Real fL = recon::Flattening(&qs[4][0], qs[1][1], qs[1][3]);
+        const Real fR = recon::Flattening(&qs[4][1], qs[1][2], qs[1][4]);
+        if (fL > Real(0)) { for (int n = 0; n < 7; ++n) wl[n] += fL * (qs[n][2] - wl[n]); sl += fL * (sl_dc - sl); }
+        if (fR > Real(0)) { for (int n = 0; n < 7; ++n) wr[n] += fR * (qs[n][3] - wr[n]); sr += fR * (sr_dc - sr); }
       }
       // positivity: fall back to donor cell on a side that reconstructed to rho<=0 or p<=0
-      if (L.d <= eos.dfloor || L.p <= eos.pfloor) {
-        L.d = dl_dc; L.u = ul_dc; L.v = vl_dc; L.w = wl_dc; L.p = pl_dc; L.by = byl_dc; L.bz = bzl_dc;
-      }
-      if (Rr.d <= eos.dfloor || Rr.p <= eos.pfloor) {
-        Rr.d = dr_dc; Rr.u = ur_dc; Rr.v = vr_dc; Rr.w = wr_dc; Rr.p = pr_dc; Rr.by = byr_dc; Rr.bz = bzr_dc;
-      }
+      if (wl[0] <= eos.dfloor || wl[4] <= eos.pfloor) { for (int n = 0; n < 7; ++n) wl[n] = qs[n][2]; sl = sl_dc; }
+      if (wr[0] <= eos.dfloor || wr[4] <= eos.pfloor) { for (int n = 0; n < 7; ++n) wr[n] = qs[n][3]; sr = sr_dc; }
+
+      State L{wl[0], wl[1], wl[2], wl[3], wl[4], wl[5], wl[6]};
+      State Rr{wr[0], wr[1], wr[2], wr[3], wr[4], wr[5], wr[6]};
       const Real b_n = bn(k, j, i);
       if (low_mach) {
         // z = min(1, max(M_L, M_R)) with the fast magnetosonic Mach number; blends the normal
@@ -133,13 +177,49 @@ void Fluxes(const Mesh &m, const Config &cfg, Arr3 bn) {
         L.u = um + ud; Rr.u = um - ud;
       }
       Real f[NFLX];
-      if constexpr (S == RSolver::hlld) HLLD(L, Rr, b_n, eos, f);
-      else HLLE(L, Rr, b_n, eos, f);
+      if constexpr (S == RSolver::hlld) {
+        HLLD(L, Rr, b_n, eos, f);
+      } else if constexpr (S == RSolver::lhlld) {
+        // Minoshima & Miyoshi (2021): shock detector theta from the cell-centered velocity
+        // jumps (normal and transverse) and low-Mach factor phi from the modified speed c_u
+        const int kL = k - dk, jL = j - dj, iL = i - di;
+        const Real cfmax = fmax(FastSpeed(L, b_n, eos.gamma), FastSpeed(Rr, b_n, eos.gamma));
+        const Real du = w(IVU, k, j, i) - w(IVU, kL, jL, iL);
+        Real dvw = Real(0);
+        if (has_t1) {
+          const Real d1 = fmin(fmin(w(IVV, kL, jL, iL) - w(IVV, kL - dk1, jL - dj1, iL - di1),
+                                    w(IVV, kL + dk1, jL + dj1, iL + di1) - w(IVV, kL, jL, iL)),
+                               fmin(w(IVV, k, j, i) - w(IVV, k - dk1, j - dj1, i - di1),
+                                    w(IVV, k + dk1, j + dj1, i + di1) - w(IVV, k, j, i)));
+          dvw = fmin(dvw, d1);
+        }
+        if (has_t2) {
+          const Real d2 = fmin(fmin(w(IVW, kL, jL, iL) - w(IVW, kL - dk2, jL - dj2, iL - di2),
+                                    w(IVW, kL + dk2, jL + dj2, iL + di2) - w(IVW, kL, jL, iL)),
+                               fmin(w(IVW, k, j, i) - w(IVW, k - dk2, j - dj2, i - di2),
+                                    w(IVW, k + dk2, j + dj2, i + di2) - w(IVW, k, j, i)));
+          dvw = fmin(dvw, d2);
+        }
+        // theta = [min(1, (-min(du,0) + cf) / (-min(dv,dw,0) + cf))]^a with a = 4: it drops to
+        // zero on the faces parallel to a strong grid-aligned shock, where the pressure term
+        // of S_M feeds the carbuncle / odd-even instability.
+        const Real ratio = fmin(Real(1), (-fmin(du, Real(0)) + cfmax) / (-dvw + cfmax));
+        const Real r2 = ratio * ratio;
+        const Real theta = r2 * r2;
+        const Real chi = fmin(Real(1), fmax(FlowSpeedU(L, b_n), FlowSpeedU(Rr, b_n)) / cfmax);
+        const Real phi = (force_phi >= Real(0)) ? force_phi : chi * (Real(2) - chi);
+        HLLD(L, Rr, b_n, eos, f, theta, phi, true);
+      } else {
+        HLLE(L, Rr, b_n, eos, f);
+      }
       flx(IDN, k, j, i) = f[FD];
       flx(IVU, k, j, i) = f[FMU];
       flx(IVV, k, j, i) = f[FMV];
       flx(IVW, k, j, i) = f[FMW];
       flx(IEN, k, j, i) = f[FEN];
+      // entropy flux: upwinded with the mass flux (averaged at an exact zero for symmetry)
+      flx(IENT, k, j, i) = (f[FD] > Real(0)) ? f[FD] * sl : (f[FD] < Real(0)) ? f[FD] * sr
+                                             : Real(0.5) * (f[FD] * (sl + sr));
       et2(k, j, i) = -f[FBY];
       et1(k, j, i) = f[FBZ];
     });
@@ -372,9 +452,26 @@ inline Real ConsToPrim(const Mesh &m, const Config &cfg, Arr4 u, Arr3 b1, Arr3 b
       const Real vx = u(IM1, k, j, i) * id, vy = u(IM2, k, j, i) * id, vz = u(IM3, k, j, i) * id;
       const Real bsq = bx * bx + by * by + bz * bz;
       const Real ke_ = Real(0.5) * d * (vx * vx + vy * vy + vz * vz);
-      Real p = eos.gm1 * (u(IEN, k, j, i) - ke_ - Real(0.5) * bsq);
-      p = fmax(p, eos.pfloor);
+      const Real etot = u(IEN, k, j, i);
+      const Real eint = etot - ke_ - Real(0.5) * bsq;
+      Real p = eos.gm1 * eint;
+      // dual energy (entropy switch): where the internal energy is a tiny fraction of the
+      // total, the subtraction above has lost its digits; use p = s rho^gamma from the
+      // separately advected entropy instead, and re-synchronize the total energy to it.
+      // Elsewhere the entropy is re-synchronized to the (reliable) total-energy pressure,
+      // so that it tracks shock heating.
+      Real sent = u(IENT, k, j, i) * id;
+      if (eos.dual_energy && eint < eos.de_eta * fabs(etot)) {
+        p = sent * pow(d, eos.gamma);
+        p = fmax(p, eos.pfloor);
+        u(IEN, k, j, i) = ke_ + Real(0.5) * bsq + p / eos.gm1;
+      } else {
+        p = fmax(p, eos.pfloor);
+        sent = p / pow(d, eos.gamma);
+        u(IENT, k, j, i) = d * sent;
+      }
       w(IDN, k, j, i) = d; w(IVX, k, j, i) = vx; w(IVY, k, j, i) = vy; w(IVZ, k, j, i) = vz; w(IPR, k, j, i) = p;
+      w(IENT, k, j, i) = sent;
       bcc(IBX, k, j, i) = bx; bcc(IBY, k, j, i) = by; bcc(IBZ, k, j, i) = bz;
       // E = -(v x B)
       ecc(0, k, j, i) = vz * by - vy * bz;
@@ -398,24 +495,21 @@ inline Real ConsToPrim(const Mesh &m, const Config &cfg, Arr4 u, Arr3 b1, Arr3 b
 
 // -----------------------------------------------------------------------------------------
 // Runtime dispatch of the compile-time templates
+template <int DIR, Recon R>
+void FluxesSolver(const Mesh &m, const Config &cfg, Arr3 bn) {
+  if (cfg.rsolver == RSolver::hlld) Fluxes<DIR, R, RSolver::hlld>(m, cfg, bn);
+  else if (cfg.rsolver == RSolver::lhlld) Fluxes<DIR, R, RSolver::lhlld>(m, cfg, bn);
+  else Fluxes<DIR, R, RSolver::hlle>(m, cfg, bn);
+}
+
 template <int DIR>
 void FluxesDispatch(const Mesh &m, const Config &cfg, Arr3 bn) {
-  const bool hlld = (cfg.rsolver == RSolver::hlld);
   switch (cfg.recon) {
-    case Recon::dc:
-      if (hlld) Fluxes<DIR, Recon::dc, RSolver::hlld>(m, cfg, bn); else Fluxes<DIR, Recon::dc, RSolver::hlle>(m, cfg, bn);
-      break;
-    case Recon::plm:
-      if (hlld) Fluxes<DIR, Recon::plm, RSolver::hlld>(m, cfg, bn); else Fluxes<DIR, Recon::plm, RSolver::hlle>(m, cfg, bn);
-      break;
-    case Recon::ppm:
-      if (hlld) Fluxes<DIR, Recon::ppm, RSolver::hlld>(m, cfg, bn); else Fluxes<DIR, Recon::ppm, RSolver::hlle>(m, cfg, bn);
-      break;
-    case Recon::ppmx:
-      if (hlld) Fluxes<DIR, Recon::ppmx, RSolver::hlld>(m, cfg, bn); else Fluxes<DIR, Recon::ppmx, RSolver::hlle>(m, cfg, bn);
-      break;
-    default:
-      if (hlld) Fluxes<DIR, Recon::wenoz, RSolver::hlld>(m, cfg, bn); else Fluxes<DIR, Recon::wenoz, RSolver::hlle>(m, cfg, bn);
+    case Recon::dc:    FluxesSolver<DIR, Recon::dc>(m, cfg, bn); break;
+    case Recon::plm:   FluxesSolver<DIR, Recon::plm>(m, cfg, bn); break;
+    case Recon::ppm:   FluxesSolver<DIR, Recon::ppm>(m, cfg, bn); break;
+    case Recon::ppmx:  FluxesSolver<DIR, Recon::ppmx>(m, cfg, bn); break;
+    default:           FluxesSolver<DIR, Recon::wenoz>(m, cfg, bn);
   }
 }
 

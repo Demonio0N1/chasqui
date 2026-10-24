@@ -1,0 +1,32 @@
+# Preset "exactitud primero" para MHD ideal con choques (editar [mesh] y [problem]).
+[mesh]
+nx1 = 128
+nx2 = 128
+nx3 = 1
+x1min = 0.0
+x1max = 1.0
+x2min = 0.0
+x2max = 1.0
+
+[time]
+integrator = rk3        # rk4 (SSPRK(4,3)) permite cfl hasta ~0.8 si manda el error espacial
+cfl = 0.4
+tlim = 0.5
+
+[mhd]
+reconstruct = ppmx      # PPM extremo-preservante (o wenoz)
+characteristic = true   # reconstruccion en variables caracteristicas: sin oscilaciones post-choque
+rsolver = lhlld         # HLLD de baja disipacion y estable frente al carbunclo (Minoshima & Miyoshi 2021)
+flatten = true
+dual_energy = true      # presion por entropia donde e_int << E (beta muy bajo, flujos frios)
+fofc = true             # red de seguridad de positividad (a posteriori)
+gamma = 1.6666666666666667
+
+[problem]
+name = orszag_tang
+
+[output]
+basename = run
+vtk_dt = 0.1
+hst_dt = 0.01
+rst_dt = 0.25
